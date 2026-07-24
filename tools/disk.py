@@ -397,8 +397,15 @@ class CoherentFS:
         nfree = _s16(struct.unpack_from("<H", sb, SB_NFREE)[0])
         if nfree < 0 or nfree > NICFREE:
             raise FSError("corrupt s_nfree=%d" % nfree)
-        if nfree == 0 or nfree == NICFREE:
-            # spill current cache into b; b becomes the next chain pointer
+        if nfree == NICFREE:
+            # Cache full: spill it into b, which becomes the next chain link
+            # (its df_free[0] points on down the chain).  V7 bfree spills ONLY
+            # at NICFREE -- never at nfree==0.  Spilling an *empty* cache would
+            # write a 0 into the chain (the old cache's zeroed df_free[0]); that
+            # 0 then gets counted/marked as a free block by icheck, tripping
+            # "1 dup in free" (block 0 == boot block) and a tfree miscount.  The
+            # chain instead terminates naturally: the deepest link points at a
+            # never-spilled data block whose df_nfree reads 0.
             fblk = bytearray(BLOCK)
             struct.pack_into("<H", fblk, FBLK_NFREE, nfree)
             fblk[FBLK_FREE:FBLK_FREE + NICFREE * 4] = sb[SB_FREE:SB_FREE + NICFREE * 4]
@@ -590,6 +597,7 @@ class CoherentFS:
             owner.write_block(owner.part_off + rel, chunk)
         now = int(time.time())
         inode.size = len(data)
+        inode.atime = now
         inode.mtime = now
         inode.ctime = now
         owner.write_inode(inode)
@@ -832,11 +840,13 @@ class CoherentFS:
 
             self.walk_inode_blocks(inode, visit)
 
-        # reset the superblock's free cache to the empty-chain sentinel
-        # (s_nfree=1, s_free[0]=0: popping the 0 means "filesystem full"),
+        # reset the superblock's free cache to EMPTY (s_nfree=0, s_free all 0:
+        # an fs with no free blocks yet).  free_block below rebuilds the chain;
+        # seeding nfree=1/free[0]=0 instead would push a bogus 0 onto the list
+        # bottom (see free_block), which icheck flags as a dup of the boot block.
         # zero the running totals, and invalidate the inode cache
         sb = self._read_sb()
-        struct.pack_into("<H", sb, SB_NFREE, 1)
+        struct.pack_into("<H", sb, SB_NFREE, 0)
         for i in range(NICFREE):
             self.write32(sb, SB_FREE + i * 4, 0)
         self.write32(sb, SB_TFREE, 0)

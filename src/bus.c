@@ -196,18 +196,18 @@ static void hdc_process(Machine *m, uint32_t cb, Disk *disk, bool is_floppy){
         case 0x01: /* Restore */
         case 0x05: /* CheckTrackFormat */
         case 0x03: /* RequestStatus */
-            /* 0x70 = "no floppy in drive" (FNOSENSE); 0x92 = HD not ready. */
-            status = disk->present ? 0x00 : (is_floppy ? 0x70 : 0x92);
+            /* 0x92 = drive not ready (hard disk or floppy). */
+            status = disk->present ? 0x00 : 0x92;
             break;
         case 0x04: /* FormatDisk (floppy only) — no low-level format to model */
-            status = disk->present ? 0x80 : 0x70;
+            status = disk->present ? 0x80 : 0x92;
             break;
         case 0x0F: /* ChangeCmdBlockAddr — new base in DMA fields (hard disk) */
             if (!is_floppy) m->hdc_cmdblk = dma;
             status = 0x00;
             break;
         case 0x08: /* Read */ {
-            if (!disk->present)              { status = is_floppy ? 0x70 : 0x92; break; }
+            if (!disk->present)              { status = 0x92; break; }
             if (lba + bcnt > disk->sectors)  { status = 0x92; break; }
             uint32_t n = (uint32_t)bcnt * 512;
             fseek(disk->fp, (long)lba * 512, SEEK_SET);
@@ -231,7 +231,7 @@ static void hdc_process(Machine *m, uint32_t cb, Disk *disk, bool is_floppy){
             status = 0x80;
             break; }
         case 0x0A: /* Write */ {
-            if (!disk->present)              { status = is_floppy ? 0x70 : 0x92; break; }
+            if (!disk->present)              { status = 0x92; break; }
             if (lba + bcnt > disk->sectors)  { status = 0x92; break; }
             uint32_t n = (uint32_t)bcnt * 512;
             fseek(disk->fp, (long)lba * 512, SEEK_SET);
