@@ -889,6 +889,9 @@ static int decode_length_compute(uint16_t op, bool segmented) {
     if (hi == 0x7D) return 1;
     if (hi == 0x7E) return 1;
     if (hi == 0x7F) return 1;
+    if (hi == 0x8E || hi == 0x8F) return 2;   /* EPA internal-op: opcode + EPU template word
+                                               * (Z8070 fldctl/fldil...). No EPU: raises the
+                                               * EPU trap with PC pushed past both words. */
     if (hi >= 0x80 && hi <= 0x8F) return 1;
     if (hi >= 0x90 && hi <= 0x9F) return 1;
     if (hi >= 0xA0 && hi <= 0xAF) return 1;

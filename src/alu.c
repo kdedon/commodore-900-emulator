@@ -400,9 +400,10 @@ AluResult alu_exec(AluOp op, uint64_t a, uint64_t b, bool carry_in, Width w) {
         case OpRes: r.value = a & ~(1ull << b); return r;  /* clear bit #b; no flags */
         case OpTset:
             /* TSET: S = old MSB of the operand; result is all-ones (write-back
-             * as the "set" side of test-and-set). Only S is meaningful; mask
-             * stays 0 because the caller special-cases merging just S. */
-            r.flags = 0; r.mask = 0;
+             * as the "set" side of test-and-set). S is the only flag affected;
+             * the mask carries exactly F_S so apply_flags merges it for every
+             * form (register, @Rn, DA, X alike). */
+            r.flags = 0; r.mask = F_S;
             if (w == WByte) { if ((uint8_t)a & 0x80) r.flags |= F_S; r.value = 0xFF; }
             else { if ((uint16_t)a & 0x8000) r.flags |= F_S; r.value = 0xFFFF; }
             return r;

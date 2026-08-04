@@ -2,8 +2,8 @@
 # C900 classic (instruction-level) emulator — portable Makefile.
 #
 # Pure C99, no external libraries.  Builds a single binary:
-#   • Windows  → c900.exe
-#   • Linux/macOS/other POSIX → c900   (no extension)
+#   • Windows  					→ c900.exe
+#   • Linux/macOS/other POSIX 	→ c900   (no extension)
 #
 # Usage:
 #   make            build the emulator (c900 / c900.exe)
@@ -22,7 +22,8 @@ CFLAGS  ?= -O3 -flto -std=c99 -Wall
 SRCDIR   = src
 BINDIR   = bin
 SRCS     = $(SRCDIR)/alu.c $(SRCDIR)/decode.c $(SRCDIR)/cpu.c \
-           $(SRCDIR)/mmu.c $(SRCDIR)/bus.c $(SRCDIR)/main.c
+           $(SRCDIR)/mmu.c $(SRCDIR)/bus.c $(SRCDIR)/wire.c \
+           $(SRCDIR)/uexec.c $(SRCDIR)/main.c
 HDRS     = $(SRCDIR)/emu.h
 
 # GNU make sets the OS variable to "Windows_NT" on Windows (including under

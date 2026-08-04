@@ -1,0 +1,84 @@
+# Build the emulator on Linux and Windows.  Every push and pull request builds
+# and runs the self-test; a v* tag also packages the binaries and publishes them
+# as release assets.
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed only by the release job
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Self-test
+        run: ./bin/c900 --selftest
+      # The layout matches the documented defaults: c900 resolves --firmware to
+      # ../rom and --disk to ../disk/hdd.bin, so running bin/c900 from inside the
+      # unpacked directory boots with no arguments.  The ROM and disk are BSD-3
+      # (rom/LICENSE.txt), which permits binary redistribution with the notice.
+      - name: Package
+        run: |
+          name=c900-${GITHUB_REF_NAME}-linux-x86_64
+          mkdir -p "$name/bin" "$name/rom" "$name/disk"
+          cp bin/c900          "$name/bin/"
+          cp rom/bios_h.bin rom/bios_l.bin rom/LICENSE.txt "$name/rom/"
+          cp disk/hdd.bin disk/LICENSE.txt "$name/disk/"
+          cp README.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: c900-*.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc make zip
+      - name: Build
+        run: make
+      - name: Self-test
+        run: ./bin/c900.exe --selftest
+      - name: Package
+        run: |
+          name=c900-${GITHUB_REF_NAME}-windows-x86_64
+          mkdir -p "$name/bin" "$name/rom" "$name/disk"
+          cp bin/c900.exe      "$name/bin/"
+          cp rom/bios_h.bin rom/bios_l.bin rom/LICENSE.txt "$name/rom/"
+          cp disk/hdd.bin disk/LICENSE.txt "$name/disk/"
+          cp README.md LICENSE "$name/"
+          zip -qr "$name.zip" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: c900-*.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ linux, windows ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/linux/*.tar.gz
+            dist/windows/*.zip
+          generate_release_notes: true

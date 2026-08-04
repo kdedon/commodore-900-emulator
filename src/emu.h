@@ -263,6 +263,29 @@ typedef struct {
  * flat image file stores them in. */
 #define FLOPPY_BLOCKS 2392u
 
+/* ───────────────── OKI MSM58321 real-time clock (board U16) ─────────────────
+ * A 4-bit clock/calendar module bit-banged through CIO #1. See bus.c for the 
+ * pin protocol and the datasheet citations. */
+typedef struct {
+    bool     present;      /* false = no module fitted (--rtc=none) */
+    uint8_t  regs[16];     /* register file, 4 bits each */
+    uint8_t  addr;         /* latched address A3..A0 (no auto-increment) */
+    bool     stopped;      /* STOP level: oscillator halted */
+    uint8_t  prev_pb;      /* previous Port B level, for strobe edge detect */
+    bool     prev_cs;      /* previous /CS level (asserted = true) */
+    uint64_t cs_since;     /* instruction count when /CS was last asserted */
+
+    /* The divider. `ips' instructions of emulated CPU time = one second;
+     * `base' is the instruction count at the start of the current second and
+     * `held' freezes the divider's contents while STOP is high. */
+    uint64_t ips;
+    uint64_t base;
+    uint64_t held;
+
+    /* Observation counters, reported at shutdown (never read by the guest). */
+    uint64_t n_read, n_write, n_tick, n_tick_selected;
+} RTC;
+
 struct Machine {
     CPU  cpu;
     MMU  mmu;
@@ -271,6 +294,7 @@ struct Machine {
 
     SCCChan scc_b;       /* console channel (AD5=0) */
     SCCChan scc_a;       /* second channel */
+    bool    wire_on;     /* channel A is attached to a host endpoint (--wire) */
 
     Disk disk;           /* hard disk, command block at hdc_cmdblk */
     Disk floppy;         /* optional floppy, command block at hdc_cmdblk+0x10 */
@@ -288,6 +312,8 @@ struct Machine {
     /* CIO#1 Port A keyboard input */
     uint8_t  pa_data;
     bool     pa_irf;
+
+    RTC      rtc;          /* OKI MSM58321 on CIO #1 Port B + PC1 */
 
     /* interrupt aggregation */
     bool     disk_vi;      /* PDMAC disk-completion VI (vector 0x80), one-shot */
@@ -307,17 +333,56 @@ struct Machine {
     bool     stop;       /* request emulator halt */
     uint64_t insn_limit; /* 0 = unlimited */
 
-    /* scripted serial input (for non-interactive testing) */
+    /* scripted serial input (for non-interactive testing).  RX_BLOCKED_POLLS is
+     * the streak of empty console RR0 reads that means the guest is waiting for
+     * a byte rather than running: an input loop polls continuously, an output
+     * path checks at most once per character printed. */
+#define RX_BLOCKED_POLLS 64
     uint8_t  inq[8192];
     int      inq_len, inq_pos;
-    uint64_t last_tx_insn;  /* insn count of the last console output byte */
+    uint64_t last_tx_insn;  /* insn count of the guest's last console activity (output byte
+                             * sent, or input byte read). After a long blocked read the
+                             * output-side clock is stale, and a byte fed on it lands before
+                             * the guest has even finished processing the previous one */
     bool     shell_up;      /* '#' prompt seen after boot → safe to feed input */
     uint32_t prompt_seq;    /* count of '#' prompts printed since boot */
     uint32_t inq_wait_seq;  /* scripted input waits for this prompt_seq before its next byte */
+    int      inq_gateoff;   /* queue index from which the prompt gate stops applying (-1 = never) */
+    bool     inq_cr_wait;   /* last scripted byte fed was a CR/LF: a command is in flight */
+    uint32_t rx_poll_streak;/* consecutive console RR0 polls (rx empty) since the last console TX;
+                             * at RX_BLOCKED_POLLS the guest is reading, not running */
+    bool     guest_polls;   /* a blocked-reading RR0 poll streak has been observed since the last
+                             * scripted byte was fed: the current reader polls, so the streak is
+                             * a usable ready signal (cleared on every feed -- not sticky) */
+    bool     at_prompt;     /* the last byte the guest transmitted on the console was a prompt
+                             * character ('#' or '>'): it has stopped talking AT a prompt, which
+                             * is stronger than having printed one somewhere in its output */
+    uint64_t idle_quiet;    /* instructions of console silence at a prompt, with the scripted
+                             * input used up, that end the run (0 = never; --idle) */
+    uint16_t stop_port;     /* I/O port whose 0xC900 write ends the run (0 = none; --stop-port) */
+    const char *stop_why;   /* why the run ended, for the closing message and the exit status */
+    bool     max_reached;   /* the run ended by exhausting --max rather than by stopping */
+
+    /* ── user-mode (--exec) hooks; both are off for a machine boot ──
+     * flat_mem replaces the board's memory decode (32K ROM at 0, DRAM only in
+     * segments 8..0x17, open bus elsewhere) with plain RAM over the whole 24-bit
+     * space, which is what a process image needs. */
+    bool     flat_mem;
+    uint8_t  flat_maxseg; /* highest segment this image installed; above it the
+                           * flat space is OPEN BUS (reads 0xFF, writes dropped),
+                           * the same as the board's unpopulated space.  A guest
+                           * that computes a far pointer into a segment nothing
+                           * loaded must not find its own data there -- that is
+                           * exactly how a dropped segment half reads as correct. */
+    void   (*sys_hook)(struct Machine *m, uint8_t num, uint32_t pc);
 };
 
 Machine *machine_new(void);
 int  machine_load_rom(Machine *m, const char *dir);
+/* Seed the RTC to a wall-clock time (the module has no battery here, so the
+ * host has to supply one at start-up) and choose the divider rate. */
+void rtc_set_time(Machine *m, int y, int mo, int d, int h, int mi, int s);
+void rtc_report(Machine *m, FILE *out);
 int  machine_attach_disk(Machine *m, const char *path);
 int  machine_attach_floppy(Machine *m, const char *path);
 void machine_run(Machine *m);
@@ -331,6 +396,12 @@ void     phys_write16(Machine *m, uint32_t addr, uint16_t v);
 /* I/O access (normal + special). Returns data (word). */
 uint16_t io_read(Machine *m, uint16_t port, bool is_byte, bool special);
 void     io_write(Machine *m, uint16_t port, uint16_t data, bool is_byte, bool special);
+
+/* channel-A wire glue (host endpoint, see wire.c) */
+int  wire_open(const char *spec, bool trace);   /* 0 on success */
+void wire_close(void);
+int  wire_poll_char(void);      /* returns byte or -1 */
+void wire_put_char(int ch);
 
 /* console glue */
 void console_init(void);

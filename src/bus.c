@@ -26,6 +26,7 @@ static bool seg_populated(uint32_t a){
 }
 uint8_t phys_read8(Machine *m, uint32_t a){
     a &= 0x00FFFFFF;
+    if (m->flat_mem) return ((a>>16) <= m->flat_maxseg) ? m->ram[a] : 0xFF;
     if (a < ROM_SIZE) return m->rom[a];
     if (seg_populated(a)) return m->ram[a];
     return 0xFF;                                    /* open bus */
@@ -49,11 +50,14 @@ void phys_write8(Machine *m, uint32_t a, uint8_t v){
     a &= 0x00FFFFFF;
     if (watch_on < 0) watch_init();
     if (watch_on && a >= watch_lo && a <= watch_hi) watch_hit(m, a, v, 8, "w8 ");
+    if (m->flat_mem) { if ((a>>16) <= m->flat_maxseg) m->ram[a] = v; return; }
     if (a < ROM_SIZE) return;                       /* ROM read-only */
     if (seg_populated(a)) m->ram[a] = v;            /* else float — ignore */
 }
 uint16_t phys_read16(Machine *m, uint32_t a){
     a &= 0x00FFFFFF;
+    if (m->flat_mem)
+        return ((a>>16) <= m->flat_maxseg) ? (((uint16_t)m->ram[a]<<8) | m->ram[a+1]) : 0xFFFF;
     if (watch_on < 0) watch_init();
     if (watch_on && a+1 >= watch_lo && a <= watch_hi)
         fprintf(stderr, "[watch] r16 %06X -> %04X pc=%02X:%04X op=%04X insns=%llu\n",
@@ -67,6 +71,7 @@ uint16_t phys_read16(Machine *m, uint32_t a){
 }
 void phys_write16(Machine *m, uint32_t a, uint16_t v){
     a &= 0x00FFFFFF;
+    if (m->flat_mem) { if ((a>>16) <= m->flat_maxseg) { m->ram[a]=(uint8_t)(v>>8); m->ram[a+1]=(uint8_t)v; } return; }
     if (watch_on < 0) watch_init();
     if (watch_on && a+1 >= watch_lo && a <= watch_hi) watch_hit(m, a, v, 16, "w16");
     if (a < ROM_SIZE) return;                                           /* ROM read-only */
@@ -77,31 +82,40 @@ void phys_write16(Machine *m, uint32_t a, uint16_t v){
 
 /* ─────────────── SCC (Z8030) — console on channel B ─────────────── */
 /* register byte read/write. reg 0 = control (WR0/RR0), reg 8 = data. */
-/* Channel-B receive interrupt pending: a character is waiting and channel B has
- * Rx interrupts enabled (WR1 D4:D3 != 0) with the master interrupt enable set
- * (WR9 D3 MIE). */
-static bool scc_rxb_int(Machine *m){
-    SCCChan *b = &m->scc_b;
-    if (!(b->wr[9] & 0x08)) return false;   /* WR9 D3 MIE */
-    if (!b->rx_avail)       return false;
-    return (b->wr[1] & 0x18) != 0;          /* WR1 D4:D3 Rx int mode != disabled */
+/* Receive interrupt pending on a channel: a character is waiting and that
+ * channel has Rx interrupts enabled (WR1 D4:D3 != 0) with the master interrupt
+ * enable set (WR9 D3 MIE, one physical register for both channels). */
+static bool scc_rx_int(SCCChan *ch){
+    if (!(ch->wr[9] & 0x08)) return false;  /* WR9 D3 MIE */
+    if (!ch->rx_avail)       return false;
+    return (ch->wr[1] & 0x18) != 0;         /* WR1 D4:D3 Rx int mode != disabled */
 }
+static bool scc_rxb_int(Machine *m){ return scc_rx_int(&m->scc_b); }
+static bool scc_rxa_int(Machine *m){ return scc_rx_int(&m->scc_a); }
 
-/* Modified interrupt vector for the Ch-B Rx-available source (SCC Tech Manual
- * Table 4-7): source code 010 replaces V3:V1 (status-low, WR9 D4=0) or V6:V4
- * (status-high). */
-static uint8_t scc_vector(Machine *m){
+/* Modified interrupt vector for an Rx-available source (SCC Tech Manual
+ * Table 4-7): the source code replaces V3:V1 (status-low, WR9 D4=0) or V6:V4
+ * (status-high).  Ch B Rx Available is 010, Ch A Rx Available is 110 — the
+ * same order the al(4) driver's setivec table assumes (vec+4 = Ch B receive,
+ * vec+12 = Ch A receive). */
+static uint8_t scc_vector_src(Machine *m, uint8_t src){
     uint8_t base = m->scc_b.wr[2];
-    if (!scc_rxb_int(m)) return base;
-    uint8_t src = 0x02;                      /* Ch B RX Available */
     if (m->scc_b.wr[9] & 0x10)               /* WR9 D4: Status High */
         return (uint8_t)((base & ~0x70) | (src << 4));
     return (uint8_t)((base & ~0x0E) | (src << 1));
 }
+/* The vector a Ch-B RR2 read returns: whichever source is currently pending,
+ * or the bare base when none is. */
+static uint8_t scc_vector(Machine *m){
+    if (scc_rxa_int(m)) return scc_vector_src(m, 0x06);
+    if (scc_rxb_int(m)) return scc_vector_src(m, 0x02);
+    return m->scc_b.wr[2];
+}
 
-/* RR3 (read on channel A) exposes the interrupt-pending bits.  D2 = Ch B Rx IP. */
+/* RR3 (read on channel A) exposes the interrupt-pending bits.  D5 = Ch A Rx IP,
+ * D2 = Ch B Rx IP. */
 static uint8_t scc_rr3(Machine *m){
-    return scc_rxb_int(m) ? 0x04 : 0x00;
+    return (uint8_t)((scc_rxa_int(m) ? 0x20 : 0) | (scc_rxb_int(m) ? 0x04 : 0));
 }
 
 /* The C900's SCC is a Z8030 (Z-Bus).  Register addressing is a hybrid: the
@@ -117,10 +131,24 @@ static uint8_t scc_read(Machine *m, int chan, int addrReg){
     case 0: {                         /* RR0: Rx avail / Tx empty / DCD / CTS */
         uint8_t v = 0x04 | 0x40 | 0x08 | 0x20;   /* Tx empty, all sent, DCD, CTS */
         if (ch->rx_avail) v |= 0x01;
+        /* A run of console RR0 polls finding the receiver empty, with no
+         * transmit in between, means the guest is blocked reading the
+         * console: a polling console-input loop reads RR0 continuously,
+         * while an output path checks it at most once per printed
+         * character.  Scripted input and the idle exit both use the streak
+         * to tell the two apart. */
+        if (chan == 0 && !ch->rx_avail) {
+            m->rx_poll_streak++;
+            if (m->rx_poll_streak >= RX_BLOCKED_POLLS) m->guest_polls = true;
+        }
         return v;
     }
     case 8:                           /* RR8 = Rx data (reading it clears rx) */
         ch->rx_avail = false;
+        if (chan == 0) {
+            m->rx_poll_streak = 0;
+            m->last_tx_insn = m->cpu.insns;   /* console activity: restart the quiet clock */
+        }
         return ch->rx_data;
     case 1: return 0x01;              /* RR1: all-sent, no errors */
     case 2: return chan == 0 ? scc_vector(m) : ch->wr[2];  /* RR2 (Ch B): modified vector */
@@ -142,17 +170,23 @@ static void scc_write(Machine *m, int chan, int addrReg, uint8_t v){
         return;
     }
     if (r == 8) {                            /* WR8 = Tx data */
+        if (chan == 1) wire_put_char(v);     /* channel A → the host endpoint */
         if (chan == 0) {
             console_put_char(v);
             m->last_tx_insn = m->cpu.insns;
-            /* The Coherent shell prompt is '#'.  Latch once the power-on tests
-             * are well behind us so scripted input is fed to the shell, not to
-             * some earlier boot-time read; count prompts so scripted input can
-             * wait for the shell to return after each command.  The power-on
-             * diagnostics and kernel banner print no '#', and boot reaches the
-             * shell prompt at roughly 2-3M instructions, so 1M clears the
-             * diagnostics while still latching on that first real prompt. */
-            if (v == '#' && m->cpu.insns > 1000000) { m->shell_up = true; m->prompt_seq++; }
+            m->rx_poll_streak = 0;
+            /* Prompt characters gate scripted input: the Coherent shell
+             * prompts with '#', the kboot menu with "boot> ", and CP/M's CCP
+             * with "A>" -- so '#' or '>' latches input-ready and counts a
+             * prompt, letting scripts pace one line per prompt across all
+             * three.  Latch only once the power-on tests are well behind us so
+             * input is fed to a real prompt, not some earlier boot-time read;
+             * the diagnostics print neither character and the first prompt
+             * appears past 2-3M instructions, so 1M clears the diagnostics. */
+            if ((v == '#' || v == '>') && m->cpu.insns > 1000000) {
+                m->shell_up = true; m->prompt_seq++;
+                m->at_prompt = true;     /* the console fell silent AT a prompt (see --idle) */
+            } else m->at_prompt = false;
         }
         return;
     }
@@ -165,6 +199,11 @@ static void scc_write(Machine *m, int chan, int addrReg, uint8_t v){
 /* deliver a byte to the console channel B receiver */
 void scc_rx_console(Machine *m, uint8_t b){
     m->scc_b.rx_data = b; m->scc_b.rx_avail = true;
+}
+
+/* deliver a byte to the channel A receiver (the second RS-232 port, /dev/tty51) */
+void scc_rx_wire(Machine *m, uint8_t b){
+    m->scc_a.rx_data = b; m->scc_a.rx_avail = true;
 }
 
 /* ─────────────── HDC/FDC command-block processing (doorbell) ───────────────
@@ -268,6 +307,278 @@ static void hdc_doorbell(Machine *m){
     hdc_process(m, m->hdc_cmdblk + 0x10, &m->floppy, true);
 }
 
+/* ─────────────── OKI MSM58321 real-time clock (board U16) ───────────────
+ *
+ * The C900 carries an OKI MSM58321 clock/calendar module at U16
+ * (~/git/C900/schematics/c900-chips.txt: "M58321 OKI Japan 4456"; datasheet
+ * ~/git/C900/docs/RTC-58321.pdf).  It has a 4-bit bidirectional bus and three
+ * strobes, all bit-banged through Z-CIO #1 — the same CIO the boot ROM uses
+ * for the keyboard:
+ *
+ *	PB0..PB3  D0..D3       bidirectional; the chip drives during READ
+ *	PB4       READ         active-high level: chip drives D0..D3
+ *	PB5       WRITE        active-high pulse: latches D0..D3 into reg[addr]
+ *	PB6       ADDR WRITE   active-high pulse: latches D0..D3 as the address
+ *	PB7       STOP         active-high LEVEL: halts the oscillator
+ *	PC1       /CS          active-low level; gates the three strobes
+ *
+ * From the datasheet, not from any particular driver:
+ *
+ *  • Register Table (p2).  Sixteen 4-bit registers; 0..0xC are the time and
+ *    calendar digits, 0xD the post-stage reset, 0xE/0xF a standard-signal
+ *    output.  No address auto-increment.
+ *  • The "*" marks there, and the Supplement's "* mark: Writable.  Recognized
+ *    as 0 while in read mode", give the read-back masks in rtc_rdmask[]: the
+ *    unused high bits of S10, MI10, W and MO10 read 0, as does the whole reset
+ *    register.  H10's 24/12 and PM/AM and D10's leap bits carry no "*" and are
+ *    ordinary readable bits.
+ *  • "PM/AM": "In 24 H mode, this will be 0", applied at read.
+ *  • "Reset register": a WRITE strobe at address 0xD, resetting the divider
+ *    after the 1/2^15 stage (and a BUSY circuit the C900 does not wire).
+ *  • "D3 and D2 of 10 days digit": the leap-year selection, 00 for the leap
+ *    year then 01, 10, 11 for a surplus of 3, 2, 1 -- a countdown.  February
+ *    has 29 days exactly when the field is 00.
+ *
+ * Whether that field self-advances at a year rollover is not stated; it is
+ * modelled as a 2-bit counter decrementing on each year carry.  Flagged as an
+ * inference in docs/RTC-NOTES.md.
+ *
+ * There is no battery, so the host seeds the chip (rtc_set_time) and the
+ * divider runs off emulated CPU time: `ips' instructions per second, default
+ * 1.5M to match the CT3 tick above.  --rtc-ips is the equivalent of
+ * overclocking the crystal, which is how a carry is made to land inside a
+ * driver's register read.  The divider advances lazily at each CIO #1 access,
+ * so it depends on the instruction count and never on host time.
+ */
+#define RTC_PB_D      0x0F
+#define RTC_PB_READ   0x10
+#define RTC_PB_WRITE  0x20
+#define RTC_PB_ADWR   0x40
+#define RTC_PB_STOP   0x80
+
+/* CIO #1 register numbers (the I/O port is 2*reg+1) the module hangs off. */
+#define CIO_PBDATA    0x0E    /* port 0x001D */
+#define CIO_PCDATA    0x0F    /* port 0x001F */
+#define CIO_PBDD      0x2B    /* port 0x0057, 1 = input */
+
+/* Instructions of emulated CPU time per second of RTC time. */
+#define RTC_DEFAULT_IPS 1500000u
+
+/* Bits a read returns; 0 where the datasheet's "*" says "recognized as 0
+ * while in read mode".  Index = register address. */
+static const uint8_t rtc_rdmask[16] = {
+    0x0F, 0x07, 0x0F, 0x07, 0x0F, 0x0F, 0x07, 0x0F,
+    0x0F, 0x0F, 0x01, 0x0F, 0x0F, 0x00, 0x00, 0x00
+};
+
+/* /CS is PC1, active low.  Port C is a plain latch here; the C900 driver
+ * makes PC1 an output before it ever asserts /CS. */
+static bool rtc_cs(Machine *m){ return (m->cio1[CIO_PCDATA] & 0x02) == 0; }
+
+static int rtc_mlen(int mo, bool leap){
+    static const int d[13] = {31,31,28,31,30,31,30,31,31,30,31,30,31};
+    if (mo < 1 || mo > 12) return 31;          /* garbage month: don't hang */
+    return (mo == 2 && leap) ? 29 : d[mo];
+}
+
+/* Day-of-week for a calendar date, 0 = Sunday (seeding only; the chip's W
+ * register free-counts mod 7 thereafter, exactly as the hardware does). */
+static int rtc_wday(int y, int m, int d){
+    static const int t[12] = {0,3,2,5,0,3,5,1,4,6,2,4};
+    if (m < 3) y -= 1;
+    return (y + y/4 - y/100 + y/400 + t[(m-1) & 15] + d) % 7;
+}
+
+static void rtc_year_tick(RTC *r){
+    int y = (r->regs[0x0C] & 0x0F) * 10 + (r->regs[0x0B] & 0x0F);
+    y = (y + 1) % 100;
+    r->regs[0x0B] = (uint8_t)(y % 10);
+    r->regs[0x0C] = (uint8_t)(y / 10);
+    /* Leap-year selection counts down: its code 00,11,10,01 corresponds to a
+     * surplus of 0,1,2,3, so one year later is one code lower. */
+    r->regs[0x08] = (uint8_t)((r->regs[0x08] & 0x03)
+                  | ((((r->regs[0x08] >> 2) + 3) & 3) << 2));
+}
+
+static void rtc_day_tick(RTC *r){
+    int d  = (r->regs[0x08] & 0x03) * 10 + (r->regs[0x07] & 0x0F);
+    int mo = (r->regs[0x0A] & 0x01) * 10 + (r->regs[0x09] & 0x0F);
+    bool leap = ((r->regs[0x08] >> 2) & 3) == 0;
+
+    r->regs[0x06] = (uint8_t)((r->regs[0x06] + 1) % 7);   /* W, free-running */
+    if (++d > rtc_mlen(mo, leap)) {
+        d = 1;
+        if (++mo > 12) { mo = 1; rtc_year_tick(r); }
+        r->regs[0x09] = (uint8_t)(mo % 10);
+        r->regs[0x0A] = (uint8_t)((r->regs[0x0A] & 0x0E) | (mo / 10));
+    }
+    r->regs[0x07] = (uint8_t)(d % 10);
+    r->regs[0x08] = (uint8_t)((r->regs[0x08] & 0x0C) | (d / 10));
+}
+
+static void rtc_hour_tick(RTC *r){
+    uint8_t h10 = r->regs[0x05];
+    int h = (h10 & 0x03) * 10 + (r->regs[0x04] & 0x0F);
+
+    if (h10 & 0x08) {                          /* 24-hour mode */
+        if (++h > 23) { h = 0; rtc_day_tick(r); }
+        r->regs[0x04] = (uint8_t)(h % 10);
+        r->regs[0x05] = (uint8_t)(0x08 | (h / 10));   /* PM/AM reads 0 in 24H */
+    } else {                                   /* 12-hour mode, PM/AM in D2 */
+        uint8_t pm = h10 & 0x04;
+        if (++h > 12) h = 1;
+        else if (h == 12) {                    /* 11 → 12 flips the half-day; */
+            pm ^= 0x04;                        /* 11 PM → 12 AM carries a day */
+            if (!pm) rtc_day_tick(r);
+        }
+        r->regs[0x04] = (uint8_t)(h % 10);
+        r->regs[0x05] = (uint8_t)(pm | (h / 10));
+    }
+}
+
+/* One second: the BCD digit counters, each with its own modulus, carrying
+ * into the next exactly as the divider chain does. */
+static void rtc_tick(RTC *r){
+    r->n_tick++;
+    if (++r->regs[0x00] > 9) {                 /* S1  */
+        r->regs[0x00] = 0;
+        if (++r->regs[0x01] > 5) {             /* S10 */
+            r->regs[0x01] = 0;
+            if (++r->regs[0x02] > 9) {         /* MI1 */
+                r->regs[0x02] = 0;
+                if (++r->regs[0x03] > 5) {     /* MI10 */
+                    r->regs[0x03] = 0;
+                    rtc_hour_tick(r);
+                }
+            }
+        }
+    }
+}
+
+/* Advance the divider to the current instruction count.  Frozen by STOP. */
+static void rtc_advance(Machine *m){
+    RTC *r = &m->rtc;
+    if (!r->present || r->stopped) return;
+    uint64_t now = m->cpu.insns;
+    while (now - r->base >= r->ips) {
+        r->base += r->ips;                     /* = when this carry happened */
+        rtc_tick(r);
+        /* Did the carry land inside a transaction, i.e. after the driver
+         * asserted /CS and before it released it?  That is the race a clock
+         * driver has to survive, and counting it is how a test can prove it
+         * actually happened rather than hoping. */
+        if (rtc_cs(m) && r->base >= r->cs_since) r->n_tick_selected++;
+    }
+}
+
+static void rtc_set_stop(Machine *m, bool stop){
+    RTC *r = &m->rtc;
+    if (stop == r->stopped) return;
+    if (stop) { rtc_advance(m); r->held = m->cpu.insns - r->base; r->stopped = true; }
+    else      { r->base = m->cpu.insns - r->held; r->stopped = false; }
+}
+
+/* Port B write: strobe edge detection.  ADDR-WRITE and WRITE act only while
+ * /CS is asserted; STOP is wired straight to the pin and is not gated. */
+static void rtc_pb_write(Machine *m, uint8_t v){
+    RTC *r = &m->rtc;
+    if (!r->present) return;
+    /* Note the /CS edge BEFORE catching the divider up: the accesses that
+     * assert /CS are often the first CIO traffic in a long while, and the
+     * seconds they discover elapsed before the transaction began. */
+    if (rtc_cs(m) && !r->prev_cs) r->cs_since = m->cpu.insns;
+    r->prev_cs = rtc_cs(m);
+    rtc_advance(m);
+    uint8_t old = r->prev_pb;
+    if (rtc_cs(m)) {
+        if ((v & RTC_PB_ADWR) && !(old & RTC_PB_ADWR))
+            r->addr = v & RTC_PB_D;
+        if ((v & RTC_PB_WRITE) && !(old & RTC_PB_WRITE)) {
+            r->n_write++;
+            if (r->addr == 0x0D) {             /* post-stage reset */
+                r->base = m->cpu.insns;
+                r->held = 0;
+            } else {
+                r->regs[r->addr] = v & RTC_PB_D;
+            }
+        }
+    }
+    r->prev_pb = v;
+    rtc_set_stop(m, (v & RTC_PB_STOP) != 0);
+}
+
+/* Port B read.  The chip drives D0..D3 while /CS is asserted and READ is
+ * high; the CIO returns the pin for the bits it has programmed as inputs and
+ * its own output latch for the rest.
+ *
+ * With the module absent — or with PB0..3 still outputs — the caller sees the
+ * latch instead.  That is a property of the CIO and of an unpopulated socket,
+ * NOT of the chip: the block diagram drives D0..D3 through a tri-state stage
+ * enabled by CS + READ, and the address latch is write-only, so a fitted
+ * module can never echo the address back.  What a bare board's floating pins
+ * really read is unknown; the latch is modelled here because it is the one
+ * level the emulator can justify. */
+static uint8_t rtc_pb_read(Machine *m, uint8_t latch){
+    RTC *r = &m->rtc;
+    if (!r->present) return latch;
+    rtc_advance(m);
+    if (!rtc_cs(m) || !(latch & RTC_PB_READ)) return latch;
+    uint8_t din = m->cio1[CIO_PBDD] & RTC_PB_D;      /* 1 = CIO input */
+    if (!din) return latch;
+    uint8_t v = r->regs[r->addr] & rtc_rdmask[r->addr];
+    if (r->addr == 0x05 && (r->regs[0x05] & 0x08)) v &= (uint8_t)~0x04;
+    r->n_read++;
+    return (uint8_t)((latch & ~din) | (v & din));
+}
+
+/* Seed the register file from a wall-clock time, in 24-hour mode.  This
+ * stands in for the battery-backed contents real silicon would hold. */
+void rtc_set_time(Machine *m, int y, int mo, int d, int h, int mi, int s){
+    RTC *r = &m->rtc;
+    r->regs[0x00] = (uint8_t)(s % 10);   r->regs[0x01] = (uint8_t)(s / 10);
+    r->regs[0x02] = (uint8_t)(mi % 10);  r->regs[0x03] = (uint8_t)(mi / 10);
+    r->regs[0x04] = (uint8_t)(h % 10);   r->regs[0x05] = (uint8_t)(0x08 | (h / 10));
+    r->regs[0x06] = (uint8_t)rtc_wday(y, mo, d);
+    r->regs[0x07] = (uint8_t)(d % 10);
+    /* D10: leap-year selection (datasheet code) in D3:D2, day tens in D1:D0 */
+    r->regs[0x08] = (uint8_t)((((4 - (y & 3)) & 3) << 2) | (d / 10));
+    r->regs[0x09] = (uint8_t)(mo % 10);  r->regs[0x0A] = (uint8_t)(mo / 10);
+    r->regs[0x0B] = (uint8_t)((y % 100) % 10);
+    r->regs[0x0C] = (uint8_t)((y % 100) / 10);
+    r->addr = 0; r->prev_pb = 0; r->stopped = false;
+    r->prev_cs = false; r->cs_since = 0;
+    r->base = m->cpu.insns; r->held = 0;
+    r->present = true;
+}
+
+/* What the module saw during the run.  n_tick_selected is the count of
+ * one-second carries that landed while /CS was asserted — i.e. inside a
+ * driver's transaction, the race a clock driver has to survive.  The leap
+ * field is D10's leap-year selection as it now stands: the datasheet's
+ * countdown code, 00 for the leap year itself and 01/10/11 for a surplus of
+ * 3/2/1.  It is reported because a guest that sets the clock writes it and
+ * nothing else can see what it wrote — within one year the code and the raw
+ * surplus behave identically. */
+void rtc_report(Machine *m, FILE *out){
+    RTC *r = &m->rtc;
+    if (!r->present) { fprintf(out, "[rtc: no module fitted]\n"); return; }
+    rtc_advance(m);
+    fprintf(out,
+        "[rtc: %d%d/%d%d/%d%d %d%d:%d%d:%d%d, leap %d, %llu reads, "
+        "%llu writes, %llu ticks (%llu inside a /CS transaction), "
+        "%llu insn/s]\n",
+        r->regs[0x0A] & 1, r->regs[0x09] & 0x0F,      /* MM */
+        r->regs[0x08] & 3, r->regs[0x07] & 0x0F,      /* DD */
+        r->regs[0x0C] & 0x0F, r->regs[0x0B] & 0x0F,   /* YY */
+        r->regs[0x05] & 3, r->regs[0x04] & 0x0F,      /* HH */
+        r->regs[0x03] & 0x0F, r->regs[0x02] & 0x0F,   /* MM */
+        r->regs[0x01] & 0x0F, r->regs[0x00] & 0x0F,   /* SS */
+        (r->regs[0x08] >> 2) & 3,                     /* leap-year sel */
+        (unsigned long long)r->n_read, (unsigned long long)r->n_write,
+        (unsigned long long)r->n_tick, (unsigned long long)r->n_tick_selected,
+        (unsigned long long)r->ips);
+}
+
 /* ─────────────── I/O dispatch ─────────────── */
 uint16_t io_read(Machine *m, uint16_t port, bool is_byte, bool special){
     (void)is_byte;
@@ -289,7 +600,10 @@ uint16_t io_read(Machine *m, uint16_t port, bool is_byte, bool special){
     if ((port & 0xFF80) == 0x0000) {
         int reg = (port >> 1) & 0x3F;
         if (m->cio1_reset && reg != 0) return 0;
-        return (uint16_t)m->cio1[reg] << 8;
+        uint8_t v = m->cio1[reg];
+        /* Port B: the RTC module drives D0..D3 back at us during a READ. */
+        if (reg == CIO_PBDATA) v = rtc_pb_read(m, v);
+        return (uint16_t)v << 8;
     }
     /* CIO #2 0x0080-0x00FF (inert) */
     if ((port & 0xFF80) == 0x0080) {
@@ -344,6 +658,13 @@ void io_write(Machine *m, uint16_t port, uint16_t data, bool is_byte, bool speci
             return;
         }
         m->cio1[reg] = v;
+        /* Port B carries the RTC's data nibble and its three strobes; Port C
+         * bit 1 is its /CS, so both writes are handed to the chip model.  The
+         * Port C write is passed through rtc_pb_write with the Port B level
+         * unchanged so that only the /CS level moves — a strobe that was
+         * already high when /CS falls is not seen as an edge. */
+        if (reg == CIO_PBDATA) rtc_pb_write(m, v);
+        else if (reg == CIO_PCDATA) rtc_pb_write(m, m->rtc.prev_pb);
         return;
     }
     if ((port & 0xFF80) == 0x0080) {          /* CIO #2 */
@@ -351,6 +672,29 @@ void io_write(Machine *m, uint16_t port, uint16_t data, bool is_byte, bool speci
         uint8_t v = (uint8_t)(data >> 8);
         if (reg == 0x00 && !(v & 0x01)) m->cio2_reset = false;
         m->cio2[reg] = v;
+        return;
+    }
+    /* Stop doorbell (--stop-port): an EXPLICIT end-of-session signal for guest
+     * code that is free to make one.  A word write of 0xC900 to port 0x0FFE
+     * ends the run with status 0, exactly as the idle rule does; any other
+     * value is ignored, so a wild store into unclaimed I/O space cannot ring
+     * it.  Nothing in the machine answers 0x0FFE -- it is above every port the
+     * board decodes (CIO 0x0000-0x00FF, SCC 0x0100-0x017F, system latch
+     * 0x0200-0x02FF, PDMAC 0x0500-0x05FF) -- and an I/O port rather than a
+     * memory address on purpose: Z8000 I/O space needs no MMU mapping, so a
+     * guest rings it with the outb() it already has, while a physical address
+     * would need a segment set up first and would sit in the graphics-card
+     * space (0x37/0x3A/0x3E/0x3F) that our own cursor code writes to.
+     *
+     * This is the deterministic mechanism and it truncates nothing, because
+     * the guest picks the moment.  It costs a program on the guest's disk,
+     * which is why it is not what the CP/M verify suite uses -- see --idle. */
+    if (port == m->stop_port && m->stop_port) {
+        if (data == 0xC900) {                 /* outb(port,0xC9) lands here too:
+                                               * a byte OUT drives D15:D8 */
+            m->stop = true;
+            m->stop_why = "the guest rang the stop doorbell";
+        }
         return;
     }
     if ((port & 0xFF00) == 0x0200) return;    /* system latch (write-only, ignore) */
@@ -365,11 +709,19 @@ void io_write(Machine *m, uint16_t port, uint16_t data, bool is_byte, bool speci
 Machine *machine_new(void){
     decode_init();
     Machine *m = calloc(1, sizeof *m);
-    m->ram = calloc(PHYS_SIZE, 1);
+    /* +2 guard bytes: the flat (--exec) word accessors touch a and a+1 without
+     * a decode check, and a is allowed to be the last address of the space. */
+    m->ram = calloc(PHYS_SIZE + 2, 1);
     m->cpu.m = m;
     m->hdc_cmdblk = 0x080000;
     m->cio1_reset = true;
     m->cio2_reset = true;
+    /* The module is fitted on a real board, so it is fitted by default.  One
+     * second = RTC_DEFAULT_IPS instructions, the same rate the CT3 tick
+     * approximation above implies (TC 30000 → ~100 Hz).  main() seeds the
+     * time; without a seed the chip starts at 1978-01-01 00:00:00. */
+    m->rtc.ips = RTC_DEFAULT_IPS;
+    rtc_set_time(m, 1978, 1, 1, 0, 0, 0);
     mmu_reset(&m->mmu);
     return m;
 }
@@ -427,31 +779,86 @@ void machine_run(Machine *m){
     uint64_t idle = 0;
     for (;;) {
         if (m->stop) break;
-        if (m->insn_limit && c->insns >= m->insn_limit) break;
+        if (m->insn_limit && c->insns >= m->insn_limit) {
+            m->stop_why = "instruction budget (--max) exhausted";
+            m->max_reached = true;       /* the one ending --require-stop rejects */
+            break;
+        }
+
+        /* Idle exit (--idle, off unless armed): the scripted input is used up,
+         * a prompt character was the last thing printed, the console has been
+         * quiet for idle_quiet, and the guest is spinning on RR0.
+         *
+         * The poll streak is what separates a guest waiting from a guest
+         * working -- silence does not, since a long computation prints nothing
+         * either.  A guest that reads the console by interrupt never builds a
+         * streak, so the channel never fires for one. */
+        if (m->idle_quiet && m->inq_len && m->inq_pos >= m->inq_len &&
+            m->at_prompt && m->rx_poll_streak >= RX_BLOCKED_POLLS &&
+            (c->insns - m->last_tx_insn) > m->idle_quiet) {
+            m->stop_why = "scripted input consumed, guest blocked at a prompt";
+            break;
+        }
 
         /* Poll host console only every 4096 instructions — _kbhit()/read()
          * is a syscall and doing it per-instruction dominates runtime. */
         if (!m->scc_b.rx_avail) {
-            /* Coherent reads the console via the SCC Rx interrupt, so it does
-             * NOT poll RR0 while idle — deliver the next byte once the shell
-             * prompt is up and the console has been briefly TX-quiet (the shell
-             * is blocked waiting for the Rx interrupt).  Feeding a byte sets
-             * rx_avail, which raises the vectored Rx interrupt below.  After a
-             * carriage return we wait for a fresh '#' prompt (prompt_seq to
-             * advance) before feeding the next command's first byte, so a
-             * still-running command can't swallow it. */
+            /* Coherent reads the console by Rx interrupt and does not poll RR0
+             * while idle, so a byte goes in once the prompt is up and the
+             * console has been briefly TX-quiet.  After a CR we wait for a
+             * fresh '#' (prompt_seq to advance) before the next command's first
+             * byte, so a still-running command cannot swallow it. */
+            /* Past inq_gateoff the prompt requirement drops; the quiet-console
+             * one still applies.  A curses program prints no `#', so without
+             * this the CR ending its first input is the last byte it can ever
+             * receive.  A position rather than a flag: the shell commands that
+             * set the game up still need the gate. */
+            bool past_gate = (m->inq_gateoff >= 0 &&
+                              m->inq_pos >= m->inq_gateoff);
+            /* The first byte past the gate waits much longer: a curses program
+             * is noisy while it draws and only then goes quiet to read, and
+             * that quiet is the only ready signal available. */
+            uint64_t quiet = (past_gate && m->inq_pos == m->inq_gateoff)
+                             ? 40000000ull : 300000ull;
+            /* Past the gate a command's own output pauses look like silence,
+             * and a byte fed into one is eaten by its output path (CP/M's BDOS
+             * checks for ^S/^C there).  So wait until the guest is provably
+             * reading: an RR0 poll streak, or the long silence for a guest that
+             * never polls.  Per-byte, not sticky -- the boot ROM polls at its
+             * menu, and a sticky flag would then pace an interrupt-driven guest
+             * booted through it at 40M per keystroke. */
+            if (past_gate && (m->inq_cr_wait || m->guest_polls) &&
+                m->rx_poll_streak < RX_BLOCKED_POLLS)
+                quiet = 40000000ull;
             if (m->inq_pos < m->inq_len && m->shell_up &&
-                m->prompt_seq >= m->inq_wait_seq &&
-                (c->insns - m->last_tx_insn) > 300000) {
+                (past_gate || m->prompt_seq >= m->inq_wait_seq) &&
+                (c->insns - m->last_tx_insn) > quiet) {
                 uint8_t b = m->inq[m->inq_pos++];
                 scc_rx_console(m, b);
-                if (b == '\r' || b == '\n') m->inq_wait_seq = m->prompt_seq + 1;
+                if (getenv("C900_FEED_DEBUG"))
+                    fprintf(stderr, "[feed %02x '%c' insns=%llu streak=%u polls=%d quiet=%llu]\n",
+                            b, (b>=32&&b<127)?b:'.', (unsigned long long)c->insns,
+                            m->rx_poll_streak, m->guest_polls, (unsigned long long)quiet);
+                m->guest_polls = false;
+                m->inq_cr_wait = (b == '\r' || b == '\n');
+                if (m->inq_cr_wait) m->inq_wait_seq = m->prompt_seq + 1;
             } else if ((m->tick_counter & 0x0FFF) == 0) {
                 int ch = console_poll_char();
-                if (ch == 0x1D) m->stop = true;                /* Ctrl-] quits the emulator;
+                if (ch == 0x1D) { m->stop = true; m->stop_why = "Ctrl-] at the console"; }
+                                                               /* Ctrl-] quits the emulator;
                                                                 * Ctrl-C (0x03) passes through */
                 else if (ch >= 0) scc_rx_console(m, (uint8_t)ch);   /* serial input */
             }
+        }
+
+        /* Channel A receiver: take the next byte from the host endpoint only
+         * once the guest has read the previous one.  The real chip has a
+         * three-deep FIFO and a byte arriving faster than the driver services
+         * the Rx interrupt is simply lost; here the endpoint holds it instead,
+         * so the wire cannot overrun the guest and SLIP frames arrive whole. */
+        if (m->wire_on && !m->scc_a.rx_avail && (m->tick_counter & 0x3F) == 0) {
+            int wb = wire_poll_char();
+            if (wb >= 0) scc_rx_wire(m, (uint8_t)wb);
         }
 
         m->tick_counter++;
@@ -469,13 +876,18 @@ void machine_run(Machine *m){
          * CIO #1 (CT3 timer) outranks the PDMAC disk completion. */
         bool ct3_int = (m->cio1[0x0C] & 0x20) && (m->cio1[0x0C] & 0x40)   /* CT3 IP & IE */
                     && (m->cio1[0x00] & 0x80);                            /* MICR MIE */
+        /* Within the SCC, channel A outranks channel B (chip-internal daisy
+         * chain), so a busy wire is serviced ahead of a console keystroke. */
+        bool scc_a_int = scc_rxa_int(m);                                  /* Ch A Rx available */
         bool scc_int = scc_rxb_int(m);                                    /* Ch B Rx available */
         if (ct3_int) {
             uint8_t vec = m->cio1[0x04];                                  /* CTIV */
             if (m->cio1[0x00] & 0x04) vec &= ~0x07u;                      /* CTVIS: CT3 → ctNum 0 */
             c->vi_line = true; c->vi_vector = vec; m->last_vi_disk = false;
+        } else if (scc_a_int) {
+            c->vi_line = true; c->vi_vector = scc_vector_src(m, 0x06); m->last_vi_disk = false;
         } else if (scc_int) {
-            c->vi_line = true; c->vi_vector = scc_vector(m); m->last_vi_disk = false;
+            c->vi_line = true; c->vi_vector = scc_vector_src(m, 0x02); m->last_vi_disk = false;
         } else if (m->disk_vi) {
             c->vi_line = true; c->vi_vector = 0x80; m->last_vi_disk = true;
         } else {
@@ -489,7 +901,10 @@ void machine_run(Machine *m){
         if (c->serviced == IRQ_VI && m->last_vi_disk) m->disk_vi = false;
 
         if (c->halted && !c->vi_line && !m->disk_vi) {
-            if (++idle > 2000000) break;     /* stuck halted with no wakeup */
+            if (++idle > 2000000) {          /* stuck halted with no wakeup */
+                m->stop_why = "the guest halted with no interrupt pending";
+                break;
+            }
         } else idle = 0;
     }
     console_shutdown();

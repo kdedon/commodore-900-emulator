@@ -41,7 +41,7 @@ static uint32_t addr_sub(uint32_t a, uint32_t n){ return (a&0xFFFF0000u)|((a-n)&
  * holding a packed seg address; non-segmented: a plain 16-bit offset. */
 static uint32_t addr_from_reg(CPU *c, uint8_t r){
     if (SEG(c)) return seg_addr(rl(c, r&0x0E));
-    return rw(c, r);
+    return (c->pc & 0x7F0000u) | rw(c, r);   /* nonseg: PC's segment */
 }
 /* Store effective address a back into register r (inverse of addr_from_reg):
  * segmented writes seg into the even reg (bits 14:8) and offset into the odd. */
@@ -80,7 +80,7 @@ static uint32_t seg_addr_op(CPU *c, int idx){
         if (w1&0x8000) return seg | c->opcode[idx+1];  /* long: separate offset word */
         return seg | (w1&0xFF);                         /* short: 8-bit inline offset */
     }
-    return c->opcode[idx];
+    return (c->pc & 0x7F0000u) | c->opcode[idx];        /* nonseg: PC's segment */
 }
 
 /* ── MMU-translated physical memory access ──
@@ -205,13 +205,13 @@ static uint8_t sp_reg(CPU *c){ return SEG(c) ? 14 : 15; }
 static void push_word(CPU *c, uint16_t v){
     uint8_t sp=sp_reg(c);
     if (SEG(c)) { uint32_t a=addr_sub(addr_from_reg(c,sp),2); addr_to_reg(c,sp,a); mem_w16(c,a,v); }
-    else { uint16_t a=rw(c,sp)-2; ww(c,sp,a); mem_w16(c,a,v); }
+    else { uint16_t a=rw(c,sp)-2; ww(c,sp,a); mem_w16(c,(c->pc&0x7F0000u)|a,v); }
 }
 /* Postincrement pop of one word: read at SP then SP += 2. */
 static uint16_t pop_word(CPU *c){
     uint8_t sp=sp_reg(c);
     if (SEG(c)) { uint32_t a=addr_from_reg(c,sp); uint16_t v=mem_r16(c,a); addr_to_reg(c,sp,addr_add(a,2)); return v; }
-    else { uint16_t a=rw(c,sp); uint16_t v=mem_r16(c,a); ww(c,sp,a+2); return v; }
+    else { uint16_t a=rw(c,sp); uint16_t v=mem_r16(c,(c->pc&0x7F0000u)|a); ww(c,sp,a+2); return v; }
 }
 
 /* Privileged-instruction guard: privileged ops are only legal in system mode.
@@ -399,7 +399,7 @@ static void exec_branch(CPU *c, const CtrlWord *w){
             uint8_t cc=nib3(op);
             if (!cond_true(c,cc)) break;
             if (SEG(c)) { uint16_t hi=pop_word(c); uint16_t lo=pop_word(c); c->pc=seg_addr(((uint32_t)hi<<16)|lo); }
-            else c->pc=pop_word(c);
+            else c->pc=(c->pc&0x7F0000u)|pop_word(c);   /* nonseg: stay in PC's segment */
             break;
         }
     }
@@ -958,6 +958,15 @@ static bool handle_interrupts(CPU *c){
     else if ((c->irq_req & IRQ_NVI) && (c->fcw&FCW_NVIE)) { vecoff=V_NVI; bit=IRQ_NVI; intack_kind=3; }
     else if ((c->irq_req & IRQ_VI) && (c->fcw&FCW_VIE)) { vecoff=V_VI; bit=IRQ_VI; intack_kind=4; }
     else return false;
+
+    /* User-mode (--exec) system-call service.  The hook runs BEFORE the trap
+     * frame is pushed, so the guest's R15 still points at the return address the
+     * libc stub's CALL left there and the call's arguments sit above it.  The
+     * trap itself then proceeds normally: it vectors to an IRET stub, which
+     * returns to the instruction after the SC with whatever the hook left in
+     * R0/R1.  Nothing here fires during a machine boot (sys_hook is NULL). */
+    if (internal && bit==IRQ_SYSCALL && c->m->sys_hook)
+        c->m->sys_hook(c->m, (uint8_t)(c->cur_op & 0xFF), c->instr_start);
 
     uint16_t oldfcw=c->fcw;                  /* FCW to push (the interrupted context) */
     uint32_t vecaddr=vector_addr(c, vecoff);
