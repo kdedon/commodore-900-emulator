@@ -24,29 +24,19 @@
  * FAIL LOUDLY.  A plausible-looking return value from a call that did nothing is
  * the failure mode a test oracle may not have.
  */
-/* The syscall shim is a POSIX program: it services the guest's calls with the
- * host's open/read/link/mknod/utimes/opendir, which is the whole point of it.
- * The feature-test macros ask for those declarations under -std=c99, which
- * otherwise exposes only the ISO C library.  On Windows the mode is not built
- * at all (see the #else at the end of this file); the machine emulator is
- * unaffected and still builds there. */
-#if !defined(_WIN32)
-#define _XOPEN_SOURCE 700
-#define _DEFAULT_SOURCE 1
+/* The syscall shim services the guest's calls with the host's
+ * open/read/link/mknod/utime/opendir, which is the whole point of it.  hostfs.h
+ * is where those calls come from: on a POSIX host it is the include list and
+ * the feature-test macros that expose them under -std=c99, and on Windows it
+ * supplies the ones the C runtime spells differently, refuses, or would perform
+ * in text mode. */
+#include "hostfs.h"
 
 #include "emu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
-#include <errno.h>
-#include <time.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/time.h>
 
 /* ─────────────────────────── COHERENT constants ───────────────────────────
  * errno values (include/errno.h).  The kernel does not return these: trap.c
@@ -388,6 +378,7 @@ static void seg_image(const uint8_t *b, size_t len, const char *path, const char
  * arguments and returns a 16-bit int in R1 — the FULL deliverable pipeline
  * (cc0->cc1->cc2->ld->execute).  Prints `R1 = N (signed M)'. */
 int run_objint(const char *path, int argc, char **argv){
+    host_stdio_binary();
     size_t len; uint8_t *b = read_file(path, &len);
     uint8_t code_seg; uint16_t entry;
     seg_image(b, len, path, "f", &code_seg, &entry);
@@ -428,6 +419,7 @@ int run_objint(const char *path, int argc, char **argv){
 
 /* ─────────────────────────── -runobj (float) ─────────────────────────── */
 int run_floatobj(const char *path, uint64_t a, uint64_t bb, uint64_t want, int retbits){
+    host_stdio_binary();
     size_t len; uint8_t *b = read_file(path, &len);
     uint8_t code_seg; uint16_t entry;
     seg_image(b, len, path, "f", &code_seg, &entry);
@@ -659,7 +651,7 @@ static GFile *get_fd(int fd){
  * unswapped one stat(2) reports, so no entry of ".." ever matched. */
 static uint16_t ino_of(const char *p){
     struct stat st;
-    return lstat(p, &st) == 0 ? guest_ino((uint64_t)st.st_ino) : 1;
+    return host_lstat(p, &st) == 0 ? guest_ino(host_ino(p, &st)) : 1;
 }
 static uint8_t *dir_put(uint8_t *buf, size_t *cap, size_t *n, uint16_t ino, const char *name){
     if (*n + 16 > *cap) { *cap *= 2; buf = realloc(buf, *cap); }
@@ -716,7 +708,7 @@ static bool is_tty(GFile *g){ return g && g->fd >= 0 && isatty(g->fd); }
  * first (a pager rejects a directory, an archiver rejects anything not
  * regular).  The whole 30 bytes are faulted on up front, so a buffer that
  * straddles the end of its segment reports failure instead of indexing past it. */
-static bool write_stat_buf(uint32_t sbp, const struct stat *st){
+static bool write_stat_buf(uint32_t sbp, const struct stat *st, const char *path){
     const int statsz = 30;
     if (!u_range_ok(sbp, statsz)) return false;
     for (int k = 0; k < statsz; k++) u_w8(sbp, k, 0);
@@ -745,7 +737,7 @@ static bool write_stat_buf(uint32_t sbp, const struct stat *st){
     if (sz > 0xFFFFFFFFull) sz = 0xFFFFFFFFull;
     uint32_t mt = (uint32_t)st->st_mtime;
     P16(0,  host_dev(st->st_dev));
-    P16(2,  guest_ino((uint64_t)st->st_ino));
+    P16(2,  guest_ino(host_ino(path, st)));
     P16(4,  mode);
     P16(6,  (uint16_t)st->st_nlink);
     P16(12, rdev);
@@ -1010,6 +1002,7 @@ static void sys_hook(Machine *m, uint8_t num, uint32_t pc);
 
 /* ─────────────────────────── -runexec ─────────────────────────── */
 int run_exec(const char *path, int argc, char **argv){
+    host_stdio_binary();
     size_t len; uint8_t *b = read_file(path, &len);
     LoutHdr h = lout_parse(b, len, path);
     uint8_t entry_seg = h.entry_seg; uint16_t entry_off = h.entry_off;
@@ -1129,8 +1122,13 @@ int run_exec(const char *path, int argc, char **argv){
     exec_exited = false; exec_code = 0;
     UM->sys_hook = sys_hook;
     cpu_reset(&UM->cpu);
-    /* Budget: compiler passes over large inputs run billions of cycles. */
-    int why = urun(8000000000ull, &exec_exited);
+    /* Budget: compiler passes over large inputs run billions of cycles.
+     * $N2BUDGET lowers it, which is how a harness can be shown handling a run
+     * that stops without an exit -- the condition it must not read as one. */
+    uint64_t budget = 8000000000ull;
+    const char *bs = getenv("N2BUDGET");
+    if (bs && *bs) budget = strtoull(bs, NULL, 0);
+    int why = urun(budget, &exec_exited);
 
     /* A gap has to survive to the end of the run: the one-shot warning is
      * emitted thousands of lines before the result a reader is looking at, and
@@ -1148,9 +1146,21 @@ int run_exec(const char *path, int argc, char **argv){
      * making every recipe filter it -- filtering costs a pipeline, and a
      * pipeline's exit status is its last element's, which is how a failed
      * compile becomes a successful build.  The gap warning above is NOT
-     * suppressed: it says the answer may be wrong. */
-    if (!getenv("N2QUIET"))
-        fprintf(stderr, "[exit %d]\n", exec_code);
+     * suppressed: it says the answer may be wrong.
+     *
+     * A run that faulted or ran out of budget never reached the guest's exit,
+     * so it has no exit status to print: `[exit 0]' there states a clean exit
+     * that did not happen, and every harness that reads the banner rather than
+     * the status -- which is the status this call returns 4 for -- scores it as
+     * a program that ran to completion and wrote nothing.  The banner and the
+     * process status say the same thing in every case. */
+    if (!getenv("N2QUIET")) {
+        if (!exec_exited && why)
+            fprintf(stderr, "[no exit: %s]\n",
+                    why == 1 ? "guest fault" : "instruction budget exhausted");
+        else
+            fprintf(stderr, "[exit %d]\n", exec_code);
+    }
     free(b); free(envcopy);
     if (!exec_exited && why) return 4;     /* fault or budget: not the guest's status */
     return exec_code & 0xFF;
@@ -1279,7 +1289,7 @@ static void sys_hook(Machine *m, uint8_t num, uint32_t pc){
         if (oflag & 0x100) flag |= O_CREAT;
         if (oflag & 0x200) flag |= O_TRUNC;
         if (oflag & 0x400) flag |= O_EXCL;
-        int hfd = open(pbuf, flag, perm);
+        int hfd = open(pbuf, flag|O_BINARY, perm);
         if (hfd < 0) { fail_err(); break; }
         int fd = alloc_fd();
         if (fd < 0) { close(hfd); fail(cEMFILE); break; }
@@ -1290,7 +1300,7 @@ static void sys_hook(Machine *m, uint8_t num, uint32_t pc){
     }
     case 8: {   /* creat(path, perm) -- create/truncate for writing */
         if (!path_arg(ARGL(0), pbuf, sizeof pbuf)) { fail(cEFAULT); break; }
-        int hfd = open(pbuf, O_RDWR|O_CREAT|O_TRUNC, (mode_t)(ARGW(4) & 0777));
+        int hfd = open(pbuf, O_RDWR|O_CREAT|O_TRUNC|O_BINARY, (mode_t)(ARGW(4) & 0777));
         if (hfd < 0) { fail_err(); break; }
         int fd = alloc_fd();
         if (fd < 0) { close(hfd); fail(cEMFILE); break; }
@@ -1319,7 +1329,7 @@ static void sys_hook(Machine *m, uint8_t num, uint32_t pc){
             if (stat(pbuf, &sf) == 0 && stat(pbuf2, &stt) == 0 &&
                 S_ISDIR(sf.st_mode) && S_ISDIR(stt.st_mode)) { ret_int(0); break; }
         }
-        if (link(pbuf, pbuf2) < 0) fail_err(); else ret_int(0);
+        if (host_link(pbuf, pbuf2) < 0) fail_err(); else ret_int(0);
         break;
     }
     case 14: {  /* mknod(path, mode, rdev) -- tab.c entry 14 is P+I+I, so rdev is
@@ -1344,14 +1354,14 @@ static void sys_hook(Machine *m, uint8_t num, uint32_t pc){
         }
         int rc;
         switch (typ) {
-        case mIFDIR: rc = mkdir(pbuf, perm); break;
+        case mIFDIR: rc = host_mkdir(pbuf, perm); break;
         /* A real FIFO.  Nothing here can ever be its far end -- there is one
          * process -- so it is only ever a self-rendezvous.  Creating it is still
          * the faithful answer: the callers that reach this check only that the
          * node was made. */
-        case mIFPIPE: rc = mkfifo(pbuf, perm); break;
+        case mIFPIPE: rc = host_mkfifo(pbuf, perm); break;
         case 0: case mIFREG: {
-            int f = open(pbuf, O_CREAT|O_EXCL|O_WRONLY, perm);
+            int f = open(pbuf, O_CREAT|O_EXCL|O_WRONLY|O_BINARY, perm);
             rc = f < 0 ? -1 : (close(f), 0);
             break;
         }
@@ -1378,11 +1388,10 @@ static void sys_hook(Machine *m, uint8_t num, uint32_t pc){
         uint32_t p = ARGL(0);
         if (p) {
             if (!u_range_ok(p, 10)) { fail(cEFAULT); break; }
-            struct timeval tv; gettimeofday(&tv, NULL);
-            uint32_t sec = (uint32_t)tv.tv_sec;
+            uint32_t sec; uint16_t ms;
+            host_now(&sec, &ms);
             u_w8(p,0,(uint8_t)(sec>>24)); u_w8(p,1,(uint8_t)(sec>>16));
             u_w8(p,2,(uint8_t)(sec>>8));  u_w8(p,3,(uint8_t)sec);
-            uint16_t ms = (uint16_t)(tv.tv_usec / 1000);
             u_w8(p,4,(uint8_t)(ms>>8)); u_w8(p,5,(uint8_t)ms);
             for (int k = 6; k < 10; k++) u_w8(p,k,0);   /* timezone, dstflag */
         }
@@ -1393,18 +1402,17 @@ static void sys_hook(Machine *m, uint8_t num, uint32_t pc){
                  * actime then modtime, big-endian through a far pointer.  A null
                  * pointer means "now", as on the real system. */
         if (!path_arg(ARGL(0), pbuf, sizeof pbuf)) { fail(cEFAULT); break; }
-        struct timeval tvs[2];
-        gettimeofday(&tvs[0], NULL); tvs[1] = tvs[0];
+        uint32_t nowsec; uint16_t nowms;
+        host_now(&nowsec, &nowms);
+        long at = (long)nowsec, mt = (long)nowsec;
         uint32_t p = ARGL(4);
         if (p) {
             if (!u_range_ok(p, 8)) { fail(cEFAULT); break; }
-            long at = 0, mt = 0;
+            at = 0; mt = 0;
             for (int k = 0; k < 4; k++) at = at<<8 | u_r8(p, k);
             for (int k = 0; k < 4; k++) mt = mt<<8 | u_r8(p, 4+k);
-            tvs[0].tv_sec = at; tvs[0].tv_usec = 0;
-            tvs[1].tv_sec = mt; tvs[1].tv_usec = 0;
         }
-        if (utimes(pbuf, tvs) < 0) fail_err(); else ret_int(0);
+        if (host_utime(pbuf, at, mt) < 0) fail_err(); else ret_int(0);
         break;
     }
     case 16:    /* chown(path, uid, gid) -- accepted and not applied: the guest
@@ -1499,7 +1507,7 @@ static void sys_hook(Machine *m, uint8_t num, uint32_t pc){
         if (!path_arg(ARGL(0), pbuf, sizeof pbuf)) { fail(cEFAULT); break; }
         struct stat st;
         if (stat(pbuf, &st) < 0) { fail_err(); break; }
-        if (!write_stat_buf(ARGL(4), &st)) { fail(cEFAULT); break; }
+        if (!write_stat_buf(ARGL(4), &st, pbuf)) { fail(cEFAULT); break; }
         ret_int(0);
         break;
     }
@@ -1509,7 +1517,7 @@ static void sys_hook(Machine *m, uint8_t num, uint32_t pc){
         struct stat st;
         int rc = g->dir ? stat(g->path, &st) : fstat(g->fd, &st);
         if (rc < 0) { fail_err(); break; }
-        if (!write_stat_buf(ARGL(2), &st)) { fail(cEFAULT); break; }
+        if (!write_stat_buf(ARGL(2), &st, g->path)) { fail(cEFAULT); break; }
         ret_int(0);
         break;
     }
@@ -1608,27 +1616,3 @@ static void sys_hook(Machine *m, uint8_t num, uint32_t pc){
     #undef ARGL
 }
 
-#else  /* _WIN32 */
-/* Windows has no POSIX filesystem layer to service COHERENT system calls
- * against, so the user-mode modes are absent rather than half-working.  The
- * machine emulator (boot a disk image) is unaffected. */
-#include "emu.h"
-#include <stdio.h>
-#include <stdint.h>
-static int uexec_unavailable(void){
-    fprintf(stderr, "c900: user-mode execution (--exec / -runobjint / -runobj) "
-                    "needs a POSIX host; this build has none\n");
-    return 1;
-}
-int run_objint(const char *p, int c, char **v){ (void)p;(void)c;(void)v; return uexec_unavailable(); }
-int run_exec(const char *p, int c, char **v){ (void)p;(void)c;(void)v; return uexec_unavailable(); }
-/* Says SKIPPED rather than returning a silent pass: the layout arithmetic it
- * checks belongs to a mode this build does not have, and a check that cannot
- * fail must not read as one that passed. */
-int lout_layout_selftest(void){
-    printf("l.out layout checks SKIPPED (user-mode execution needs a POSIX host)\n");
-    return 1;
-}
-int run_floatobj(const char *p, uint64_t a, uint64_t b, uint64_t w, int r){
-    (void)p;(void)a;(void)b;(void)w;(void)r; return uexec_unavailable(); }
-#endif /* _WIN32 */

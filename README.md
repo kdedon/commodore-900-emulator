@@ -78,7 +78,8 @@ c900 -runobj ./a.out A B WANT    # the same with IEEE double operands
 
 The mode word must come first, because **every argument after the program's
 path belongs to the guest**.  `--exec` exits with the guest's own exit status; `[exit N]`
-is also printed on stderr. 
+is also printed on stderr.  A run that faulted or exhausted the instruction
+budget never reached an exit: it prints `[no exit: ...]` instead and exits 4.
 
 Three environment variables can be defined: 
 * `N2ROOT` prefixes the guest's absolute paths (so a program finds the data files its
