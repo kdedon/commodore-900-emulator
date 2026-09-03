@@ -175,6 +175,19 @@ static void scc_write(Machine *m, int chan, int addrReg, uint8_t v){
             console_put_char(v);
             m->last_tx_insn = m->cpu.insns;
             m->rx_poll_streak = 0;
+            /* --input-mark: watch the guest's own output for the text that
+             * releases the scripted type-ahead bytes.  Matching on what is
+             * PRINTED is the one synchronisation a test can state exactly --
+             * "send this the moment that appears" is what a person at the
+             * terminal does, and unlike an instruction count it does not move
+             * when the guest is rebuilt.  On a mismatch the match restarts at
+             * this same character, so a mark can begin with the byte that
+             * broke the previous attempt. */
+            if (m->inq_mark && !m->inq_mark_seen) {
+                if (v == (uint8_t)m->inq_mark[m->inq_mark_pos]) m->inq_mark_pos++;
+                else m->inq_mark_pos = (v == (uint8_t)m->inq_mark[0]) ? 1 : 0;
+                if (m->inq_mark[m->inq_mark_pos] == '\0') m->inq_mark_seen = true;
+            }
             /* Prompt characters gate scripted input: the Coherent shell
              * prompts with '#', the kboot menu with "boot> ", and CP/M's CCP
              * with "A>" -- so '#' or '>' latches input-ready and counts a
@@ -830,15 +843,35 @@ void machine_run(Machine *m){
             if (past_gate && (m->inq_cr_wait || m->guest_polls) &&
                 m->rx_poll_streak < RX_BLOCKED_POLLS)
                 quiet = 40000000ull;
-            if (m->inq_pos < m->inq_len && m->shell_up &&
-                (past_gate || m->prompt_seq >= m->inq_wait_seq) &&
-                (c->insns - m->last_tx_insn) > quiet) {
+            /* TYPE-AHEAD (the \i escape marks the byte): deliver it the
+             * moment the receiver is free, with no gate, no prompt and no
+             * quiet wait.  Everything above answers the question "is the
+             * guest ready for this byte yet?", and answers it conservatively
+             * because a byte handed over too early is eaten by whatever read
+             * the guest happens to be in -- a boot-ROM probe, or a running
+             * program's own output path, where CP/M's BDOS polls for ^S/^Q/^C
+             * between characters.  \i is the caller saying it WANTS that
+             * reader: the ^S of a flow-control test is aimed at exactly the
+             * output-path poll the pacing exists to dodge, and no amount of
+             * waiting produces it, because a guest that is printing never
+             * looks blocked and never falls silent.  So the choice is left
+             * where it belongs, with whoever wrote the script, one byte at a
+             * time: the gated pacing is unchanged for every byte not marked,
+             * and a marked byte still waits for the receiver to be empty, so
+             * the queue can never overrun the guest or reorder itself. */
+            bool now = m->inq_pos < m->inq_len && m->inq_now[m->inq_pos] &&
+                       (!m->inq_mark || m->inq_mark_seen);
+            if (m->inq_pos < m->inq_len &&
+                (now || (m->shell_up &&
+                         (past_gate || m->prompt_seq >= m->inq_wait_seq) &&
+                         (c->insns - m->last_tx_insn) > quiet))) {
                 uint8_t b = m->inq[m->inq_pos++];
                 scc_rx_console(m, b);
                 if (getenv("C900_FEED_DEBUG"))
-                    fprintf(stderr, "[feed %02x '%c' insns=%llu streak=%u polls=%d quiet=%llu]\n",
+                    fprintf(stderr, "[feed %02x '%c' insns=%llu streak=%u polls=%d quiet=%s]\n",
                             b, (b>=32&&b<127)?b:'.', (unsigned long long)c->insns,
-                            m->rx_poll_streak, m->guest_polls, (unsigned long long)quiet);
+                            m->rx_poll_streak, m->guest_polls,
+                            now ? "type-ahead" : "waited");
                 m->guest_polls = false;
                 m->inq_cr_wait = (b == '\r' || b == '\n');
                 if (m->inq_cr_wait) m->inq_wait_seq = m->prompt_seq + 1;

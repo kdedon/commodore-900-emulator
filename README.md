@@ -32,7 +32,10 @@ The command line accepts the following arguments. Value options may be written e
 - `--floppy=FILE` — raw floppy image, attached to the floppy drive (`/dev/fd1`). Optional; when omitted the floppy drive is empty. The image is a flat 512-byte-per-sector Coherent floppy (up to 2392 blocks); a short image has its trailing sectors read back as zeros.
 - `--trace` — print periodic PC/FCW progress to stderr.
 - `--max=N` — stop after N instructions (0, the default, runs until Ctrl-]).
-- `--input="..."` — feed scripted console keystrokes, with `\r`, `\n`, `\t`, and `\\` escapes.
+- `--input="..."` — feed scripted console keystrokes, with `\r`, `\n`, `\t`, and `\\` escapes,
+  plus the `\g` and `\i` pacing marks. See "Scripted console input" below.
+- `--input-mark=TEXT` — hold every `\i` (type-ahead) byte until the guest has *printed*
+  TEXT on the console. See "Scripted console input" below.
 - `--wire=PATH` — attach SCC channel A (the guest's `/dev/tty51`) to the AF_UNIX
   stream socket `PATH`. The console is unaffected. Two emulators pointed at one
   socket — with a host program in the middle copying each end's bytes to the
@@ -50,6 +53,49 @@ For example, to boot with a floppy image attached:
 
 ```sh
 ./c900 --floppy ../disk/disk1_hr.bin
+```
+
+## Scripted console input
+
+`--input` queues bytes for the console receiver, but it does not hand them over
+as fast as it can. Each byte is **paced**: it waits until the guest looks ready
+to read it — a prompt character (`#`, `>`) has been printed, the console has
+been quiet for a while, or the guest is spinning on the receiver status
+register. That pacing is not politeness, it is correctness. The modelled SCC
+receiver holds one byte, and whoever reads next gets it: a byte handed over too
+early is swallowed by a boot-ROM probe, by a still-running command, or by a
+program's own output path — CP/M's BDOS polls the keyboard between the
+characters it prints, looking for `^S`/`^Q`/`^C`. A swallowed byte is simply
+gone, and the script silently runs on one line short.
+
+Two escapes queue no byte of their own and change that pacing:
+
+- `\g` — from this point in the script on, stop waiting for a prompt. A
+  full-screen program never prints one, so without this the first `\r` typed
+  into `ED` is the last byte it can ever receive. The quiet-console wait still
+  applies.
+- `\i` — the **next** byte is *type-ahead*: it is handed to the receiver the
+  moment the receiver is free, with no gate, no prompt and no quiet wait, the
+  way a person typing ahead of a running program delivers one. It applies to
+  exactly one byte; the rest of the script stays paced.
+
+`\i` is how you reach a guest that is *printing*. The pacing above deliberately
+waits for a guest that looks idle, and a guest in a print loop never does — so
+a scripted `^S` could never arrive while there was still output to stop, which
+is the only moment at which it means anything. `\i` puts that judgement back in
+the hands of whoever wrote the script.
+
+`--input-mark=TEXT` says *when*: no `\i` byte is released until the guest has
+printed TEXT on the console. This is the one synchronisation a test can state
+exactly — "send it the moment that appears" — and, unlike an instruction count,
+it does not move when the guest is rebuilt. The mark is a starting gun rather
+than a gate: once seen it stays open, and paced bytes are never affected by it.
+
+```sh
+# type ^S into a program's output the instant it announces itself, and
+# nothing else ever: the guest stops printing and stays stopped.
+./c900 --disk=cpm.bin --input="$(printf 'CONBRK P 0200\r\i\023')" \
+       --input-mark='CONBRK-START' --max=150000000
 ```
 
 ## Stopping a scripted run

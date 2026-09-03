@@ -348,7 +348,18 @@ struct Machine {
     uint32_t prompt_seq;    /* count of '#' prompts printed since boot */
     uint32_t inq_wait_seq;  /* scripted input waits for this prompt_seq before its next byte */
     int      inq_gateoff;   /* queue index from which the prompt gate stops applying (-1 = never) */
+    bool     inq_now[8192]; /* per-byte TYPE-AHEAD flag (the \i escape): this byte is handed to
+                             * the receiver the moment it is free, with no gate and no quiet
+                             * wait, exactly as a person typing ahead of a running program would
+                             * deliver it.  The pacing below decides WHEN a byte the guest is
+                             * not yet ready for should go in; \i is the caller saying it does
+                             * not want that decision made for this byte -- see bus.c */
     bool     inq_cr_wait;   /* last scripted byte fed was a CR/LF: a command is in flight */
+    const char *inq_mark;   /* --input-mark: text the guest must PRINT before any type-ahead
+                             * byte is released ("type this when you see that"), or NULL */
+    int      inq_mark_pos;  /* how much of inq_mark has matched the console output so far */
+    bool     inq_mark_seen; /* the whole of it has been printed: type-ahead is now open, and
+                             * stays open -- the mark is a starting gun, not a gate */
     uint32_t rx_poll_streak;/* consecutive console RR0 polls (rx empty) since the last console TX;
                              * at RX_BLOCKED_POLLS the guest is reading, not running */
     bool     guest_polls;   /* a blocked-reading RR0 poll streak has been observed since the last

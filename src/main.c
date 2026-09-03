@@ -159,7 +159,26 @@ static void usage(FILE *out, const char *prog){
         "  --floppy=FILE    raw floppy image for the floppy drive (optional)\n"
         "  --trace          print periodic PC/FCW progress to stderr\n"
         "  --max=N          stop after N instructions (0 = run until Ctrl-])\n"
-        "  --input=\"...\"    scripted console keystrokes (\\r \\n \\t \\\\ escapes)\n"
+        "  --input=\"...\"    scripted console keystrokes (\\r \\n \\t \\\\ escapes).\n"
+        "                   Bytes are PACED: each one waits until the guest looks\n"
+        "                   ready for it (a prompt printed, the console quiet, or\n"
+        "                   the guest spinning on the receiver), because a byte\n"
+        "                   handed over early is eaten by whatever read the guest\n"
+        "                   is in.  Two escapes queue no byte and change that:\n"
+        "                     \\g  from here on, stop waiting for a prompt (a\n"
+        "                         full-screen program never prints one)\n"
+        "                     \\i  the NEXT byte is TYPE-AHEAD: delivered as soon\n"
+        "                         as the receiver is free, with no pacing at all,\n"
+        "                         so it can reach a program that is printing --\n"
+        "                         which is where a ^S/^Q/^C has to land.  One byte\n"
+        "                         only; the rest of the script stays paced\n"
+        "  --input-mark=TEXT  hold every \\i byte until the guest has PRINTED\n"
+        "                   TEXT on the console, then release them.  This is\n"
+        "                   how a scripted ^S is aimed: \"send it when that\n"
+        "                   appears\", which is exact and does not move when the\n"
+        "                   guest is rebuilt, unlike an instruction count.  The\n"
+        "                   mark is a starting gun -- once seen it stays open,\n"
+        "                   and paced bytes are not affected by it at all\n"
         "  --stop-on=LIST   which early-stop channels are armed, comma-separated:\n"
         "                   \"idle\", \"port\" (the default), \"all\" or \"none\".\n"
         "                   idle: for test harnesses, OFF unless asked for.  With\n"
@@ -260,7 +279,7 @@ int main(int argc, char **argv){
     /* --- argument parsing (see usage() for the full option list) ------------
      * Value options accept both "--opt=VALUE" and "--opt VALUE". */
     const char *fw = "../rom", *disk = "../disk/hdd.bin", *floppy = NULL, *g_input = NULL;
-    const char *rtcseed = "host", *wire = NULL;
+    const char *rtcseed = "host", *wire = NULL, *g_inmark = NULL;
     unsigned long long rtc_ips = 0;
     bool trace = false, dosel = false, wtrace = false;
     unsigned long long g_max = 0;
@@ -281,6 +300,7 @@ int main(int argc, char **argv){
         else if ((v = opt_value(argv,argc,&i,"--disk")))     disk = v;
         else if ((v = opt_value(argv,argc,&i,"--floppy")))   floppy = v;
         else if ((v = opt_value(argv,argc,&i,"--max")))      g_max = strtoull(v,0,0);
+        else if ((v = opt_value(argv,argc,&i,"--input-mark"))) g_inmark = v;
         else if ((v = opt_value(argv,argc,&i,"--input")))    g_input = v;
         else if ((v = opt_value(argv,argc,&i,"--idle")))   { g_idle = strtoull(v,0,0); idle_asked = true; }
         else if ((v = opt_value(argv,argc,&i,"--stop-port"))) g_stopport = strtoul(v,0,0);
@@ -351,7 +371,11 @@ int main(int argc, char **argv){
     m->idle_quiet = on_idle ? g_idle : 0;
     m->stop_port  = on_port ? (uint16_t)g_stopport : 0;
     m->inq_gateoff = -1;                 /* prompt gate applies throughout by default */
+    /* An empty --input-mark is no mark: it would otherwise match instantly and
+     * read as "wait for nothing" rather than as the mistake it is. */
+    m->inq_mark = (g_inmark && *g_inmark) ? g_inmark : NULL;
     if (g_input) {                       /* queue scripted serial input (\r \n \t \\ escapes) */
+        bool now = false;                /* \i marks the NEXT byte as type-ahead */
         for (const char *s=g_input; *s && m->inq_len < (int)sizeof m->inq; s++) {
             uint8_t c = (uint8_t)*s;
             if (c=='\\' && s[1]) {
@@ -360,8 +384,16 @@ int main(int argc, char **argv){
                  * applying, so a script can set a curses program up with the
                  * gate on and then feed it keystrokes with the gate off. */
                 if (*s=='g') { m->inq_gateoff = m->inq_len; continue; }
+                /* \i queues no byte either: it marks the byte AFTER it as
+                 * type-ahead -- handed over the moment the receiver is free,
+                 * with none of the pacing the other bytes get.  It applies to
+                 * one byte, so a script can type ahead into a running program
+                 * (a ^S at its output) and then go back to paced delivery for
+                 * the command line that follows.  See bus.c's feeder. */
+                if (*s=='i') { now = true; continue; }
                 c = (*s=='r')?'\r':(*s=='n')?'\n':(*s=='t')?'\t':(uint8_t)*s;
             }
+            m->inq_now[m->inq_len] = now; now = false;
             m->inq[m->inq_len++] = c;
         }
     }
