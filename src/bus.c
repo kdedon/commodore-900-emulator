@@ -940,5 +940,6 @@ void machine_run(Machine *m){
             }
         } else idle = 0;
     }
+    dbg_finish(m);          /* --dump windows, once more, on whatever ended it */
     console_shutdown();
 }

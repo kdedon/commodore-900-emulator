@@ -23,7 +23,7 @@ SRCDIR   = src
 BINDIR   = bin
 SRCS     = $(SRCDIR)/alu.c $(SRCDIR)/decode.c $(SRCDIR)/cpu.c \
            $(SRCDIR)/mmu.c $(SRCDIR)/bus.c $(SRCDIR)/wire.c \
-           $(SRCDIR)/uexec.c $(SRCDIR)/main.c
+           $(SRCDIR)/uexec.c $(SRCDIR)/debug.c $(SRCDIR)/main.c
 HDRS     = $(SRCDIR)/emu.h
 
 # GNU make sets the OS variable to "Windows_NT" on Windows (including under

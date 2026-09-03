@@ -41,7 +41,9 @@ The command line accepts the following arguments. Value options may be written e
   socket — with a host program in the middle copying each end's bytes to the
   other — are two machines on one point-to-point serial line, which is what the
   guest OS needs to run SLIP between them.
-- `--stop-on=LIST` — which early-stop channels are armed: `idle`, `port`, `all` (the default), or `none` to run to `--max` whatever happens. See "Stopping a scripted run" below.
+- `--break=SEG:OFF[/N]` — record the CPU state at a guest PC. See "Breakpoints and memory dumps" below.
+- `--dump=SPEC` — record a window of guest memory, at every breakpoint hit and once at the end of the run. See "Breakpoints and memory dumps" below.
+- `--stop-on=LIST` — which early-stop channels are armed: `idle`, `port`, `break`, `all` (the default), or `none` to run to `--max` whatever happens. See "Stopping a scripted run" below.
 - `--idle=N` — instructions of console silence the `idle` channel waits for (default 40000000).
 - `--stop-port=P` — the `port` channel's I/O port (default `0x0FFE`).
 - `--require-stop` — exit 3 if the run ended by exhausting `--max` rather than by stopping, so a caller can assert that the session *finished* rather than merely that the emulator survived.
@@ -108,6 +110,86 @@ three of these hold: the scripted input is exhausted, the last byte the guest
 transmitted on the console was a prompt character, and it has transmitted
 nothing for another 40M instructions.
 * `--stop-on=port` A word write of `0xC900` to an unmapped I/O port ends the run. 
+* `--stop-on=break` The run ends once a `--break` has recorded its last hit, with the
+instruction at that PC not yet executed.
+
+## Breakpoints and memory dumps
+
+`--break` and `--dump` answer the two questions a guest cannot be asked from
+inside itself: *what were the registers when execution reached here*, and
+*what is at this address*. Both are off unless given, both write to stderr,
+and neither changes a single byte of guest state — memory windows are read
+through the MMU exactly as the guest would read them, and everything the MMU
+remembers about having been asked is put back afterwards.
+
+- `--break=SEG:OFF[/N]` records one line per hit *before* the instruction at
+  that PC executes, so "entry to a routine" means entry. Addresses are hex.
+  `SEG` may be a segment **number** (`30`) or a Z8001 segment **word**
+  (`3000`), so a PC copied out of a guest trap message pastes in unchanged.
+  `/N` (decimal, default 1) is how many hits to record; `/0` records every
+  one, which for a hot address is a great deal of output. Repeatable, up to 8.
+- `--dump=SPEC` records a window of memory at every `--break` hit *and* once
+  when the run ends, whatever ended it. Two forms:
+  - `SEG:OFF+LEN` — a fixed logical address.
+  - `rrN:DISP+LEN` — relative to the long pointer `RRn`: segment from `Rn`
+    (as a segment word), offset from `Rn+1`, plus `DISP`. `rr14:0+36` is the
+    stack frame, wherever it happens to be on this run, which is the form a
+    trap frame needs. `DISP` is hex and may be negative; `LEN` is decimal.
+
+  Repeatable, up to 8.
+
+Output is one record per line, whitespace-separated `key=value` fields behind
+a `[dbg]` tag, because the readers are test harnesses and agents rather than
+people. The CP/M suite already sends this emulator's stderr to `/dev/null`, so
+an armed run adds nothing to a transcript anyone else is reading.
+
+```
+[dbg] brk pc=30:9AD0 hit=2 insns=7729880 fcw=C040 sys=1 op=A1EC r0=7FFF r1=0000 r2=F900 ... r15=FBDC
+[dbg] mem at=brk insns=7729880 win=0 spec=rr14:0+36 addr=3F:FBDC phys=0DFBDC len=36 data=00000000F900... fault=0
+```
+
+`fault=1` on a `mem` record means some byte of the window did not translate
+(those read back as `FF`); `at=` is `brk` for a window taken at a breakpoint
+and `end` for the one taken when the run stops.
+
+### Worked example: the split-I/D fast path
+
+The regression documented in the CP/M repository's `docs/SPLITID-BISECT.md`
+was eight instructions in `src/bdos/splitfast.s` that assembled base and index
+the wrong way round, so every saved-register access in the SC-trap fast path
+went through dispatch scratch. Two host-side tests exercised the same shim's C
+half and passed throughout; nothing on the host runs the assembler half. It
+was found by building temporary instruments into the guest and rebuilding it —
+which is the worst possible way to inspect the thing you already doubt.
+
+The same evidence, with no guest change at all: break at the fast path's entry
+and dump the trap frame the SC handler left at `RR14` (saved `r0`–`r13`, then
+the identifier, FCW, PC segment and PC offset).
+
+```sh
+./c900 --disk=arxtest.bin --input="ASZ8K MINI.8KN\r" \
+       --break=30:9AD0/4 --dump=rr14:0+36 --stop-on=idle,break --max=300000000
+```
+
+Working system — the saved-register slots fill in as the shim emulates each
+access (`r2`, then `r4`, then `r1`/`r6`), and the saved PC advances:
+
+```
+data=000000000000...00000000 7FFF 0040 B200 5700
+data=00000000F9000000...0000 7FFF 0040 B200 5704
+data=00000000F90000002D2A... 7FFF 0040 B200 5708
+data=00001EB8F90000002D2A... 7FFF 0000 B200 5714
+```
+
+Broken system — four consecutive traps, every saved register still zero, only
+the PC moving. The emulated accesses are landing somewhere else:
+
+```
+data=000000000000...00000000 7FFF 0040 B200 5700
+data=000000000000...00000000 7FFF 0040 B200 5704
+data=000000000000...00000000 7FFF 0040 B200 5708
+data=000000000000...00000000 7FFF 0040 B200 571A
+```
 
 ## Running one program instead of a machine
 

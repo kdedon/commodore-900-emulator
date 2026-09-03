@@ -2,6 +2,7 @@
  *
  * Usage (see usage() / --help for the full list):
  *   c900 [--firmware=DIR] [--disk=FILE] [--floppy=FILE] [--trace] [--max=N] [--input="..."]
+ *        [--break=SEG:OFF] [--dump=SPEC]
  *   c900 --selftest
  *   c900 --help
  * Value options accept both "--opt=VALUE" and "--opt VALUE".
@@ -179,8 +180,26 @@ static void usage(FILE *out, const char *prog){
         "                   guest is rebuilt, unlike an instruction count.  The\n"
         "                   mark is a starting gun -- once seen it stays open,\n"
         "                   and paced bytes are not affected by it at all\n"
+        "  --break=SEG:OFF[/N]  record CPU state at a guest PC, before the\n"
+        "                   instruction there executes: PC, instruction count, FCW,\n"
+        "                   mode and all sixteen registers, as one \"[dbg] brk\"\n"
+        "                   key=value line on stderr.  Addresses are hex; SEG may\n"
+        "                   be a segment NUMBER (32) or a Z8001 segment WORD\n"
+        "                   (B200), so a PC out of a guest trap message pastes in\n"
+        "                   unchanged.  /N (decimal, default 1) is how many hits\n"
+        "                   to record; /0 records every one.  Repeatable\n"
+        "  --dump=SPEC      a memory window, printed at every --break hit and once\n"
+        "                   when the run ends, as a \"[dbg] mem\" line.  Two forms:\n"
+        "                     SEG:OFF+LEN   a fixed logical address\n"
+        "                     rrN:DISP+LEN  relative to the long pointer RRn --\n"
+        "                                   rr14:0+32 is the stack frame, wherever\n"
+        "                                   it is on this run\n"
+        "                   Addresses and DISP hex (DISP may be negative), LEN\n"
+        "                   decimal.  Read through the MMU exactly as the guest\n"
+        "                   would, and leaving no trace in it.  Repeatable\n"
         "  --stop-on=LIST   which early-stop channels are armed, comma-separated:\n"
-        "                   \"idle\", \"port\" (the default), \"all\" or \"none\".\n"
+        "                   \"idle\", \"port\" (the default), \"break\", \"all\" or\n"
+        "                   \"none\".\n"
         "                   idle: for test harnesses, OFF unless asked for.  With\n"
         "                     --input, stop once every scripted byte has been fed\n"
         "                     and the guest is idle at a prompt: a prompt character\n"
@@ -189,6 +208,8 @@ static void usage(FILE *out, const char *prog){
         "                   port: stop when the guest writes the word 0xC900 to the\n"
         "                     --stop-port I/O port -- an explicit \"I am finished\"\n"
         "                     from the guest, so it cannot fire on its own\n"
+        "                   break: stop once a --break has recorded its last hit,\n"
+        "                     with that instruction NOT yet executed\n"
         "  --idle=N         instructions of console silence the idle channel waits\n"
         "                   for, and arms it (default 40000000)\n"
         "  --stop-port=P    the port channel's I/O port (default 0x0FFE, which\n"
@@ -305,6 +326,12 @@ int main(int argc, char **argv){
         else if ((v = opt_value(argv,argc,&i,"--idle")))   { g_idle = strtoull(v,0,0); idle_asked = true; }
         else if ((v = opt_value(argv,argc,&i,"--stop-port"))) g_stopport = strtoul(v,0,0);
         else if ((v = opt_value(argv,argc,&i,"--stop-on")))  g_stopon = v;
+        else if ((v = opt_value(argv,argc,&i,"--break"))) {
+            if (dbg_add_break(v)) { fprintf(stderr,"--break: expected SEG:OFF[/N] in hex, e.g. 32:3EAC or B200:3EAC/2\n"); return 2; }
+        }
+        else if ((v = opt_value(argv,argc,&i,"--dump"))) {
+            if (dbg_add_dump(v)) { fprintf(stderr,"--dump: expected SEG:OFF+LEN or rrN:DISP+LEN, e.g. 0F:EF80+32 or rr14:0+32\n"); return 2; }
+        }
         else if (!strcmp(argv[i],"--require-stop")) require_stop = true;
         else if ((v = opt_value(argv,argc,&i,"--wire")))     wire = v;
         else if (!strcmp(argv[i],"--wire-trace")) wtrace = true;
@@ -356,18 +383,20 @@ int main(int argc, char **argv){
     /* --stop-on selects the channels; --idle and --stop-port only tune them.
      * Disarming a channel zeroes the field its run-loop test reads, so a
      * disarmed channel costs nothing and cannot fire. */
-    bool on_idle, on_port;
-    if (!strcmp(g_stopon,"none"))       on_idle = on_port = false;
-    else if (!strcmp(g_stopon,"all"))   on_idle = on_port = true;
+    bool on_idle, on_port, on_break;
+    if (!strcmp(g_stopon,"none"))       on_idle = on_port = on_break = false;
+    else if (!strcmp(g_stopon,"all"))   on_idle = on_port = on_break = true;
     else {
         on_idle = strstr(g_stopon,"idle") != NULL || idle_asked;
         on_port = strstr(g_stopon,"port") != NULL;
-        if (!on_idle && !on_port) {
+        on_break = strstr(g_stopon,"break") != NULL;
+        if (!on_idle && !on_port && !on_break) {
             fprintf(stderr,"--stop-on: expected a comma-separated list of "
-                           "idle and/or port, or all, or none\n");
+                           "idle, port and/or break, or all, or none\n");
             return 2;
         }
     }
+    dbg_stop_at_break(on_break);
     m->idle_quiet = on_idle ? g_idle : 0;
     m->stop_port  = on_port ? (uint16_t)g_stopport : 0;
     m->inq_gateoff = -1;                 /* prompt gate applies throughout by default */

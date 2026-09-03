@@ -414,6 +414,17 @@ void wire_close(void);
 int  wire_poll_char(void);      /* returns byte or -1 */
 void wire_put_char(int ch);
 
+/* ── debugging instruments (src/debug.c; --break / --dump) ──
+ * All opt-in: dbg_armed stays 0 until a --break is accepted, and the one test
+ * in cpu_step's hot path costs a predictable branch.  Records go to stderr as
+ * "[dbg] " key=value lines. */
+extern int dbg_armed;              /* nonzero: at least one breakpoint is set */
+int  dbg_add_break(const char *spec);   /* "SEG:OFF[/N]"        0 = accepted */
+int  dbg_add_dump(const char *spec);    /* "SEG:OFF+LEN" | "rrN:DISP+LEN" */
+void dbg_stop_at_break(bool on);        /* --stop-on=break */
+bool dbg_pc_hit(CPU *c);                /* pre-execute hook; true = stop now */
+void dbg_finish(Machine *m);            /* end-of-run memory windows */
+
 /* console glue */
 void console_init(void);
 void console_shutdown(void);

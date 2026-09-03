@@ -1125,6 +1125,11 @@ void cpu_step(CPU *c){
         if (tring_fill < TRING_N) tring_fill++;
     }
 
+    /* Breakpoints (--break), checked BEFORE the instruction executes so the
+     * recorded state is the state it is about to run on.  dbg_armed is 0
+     * unless a breakpoint was set, so an ordinary run pays one branch. */
+    if (dbg_armed && dbg_pc_hit(c)) return;   /* stopping: PC still at instr_start */
+
     /* advance PC past the instruction before executing (branches overwrite it) */
     uint32_t pc_next = addr_add(c->instr_start, (uint32_t)need*2);
     c->pc = pc_next;
