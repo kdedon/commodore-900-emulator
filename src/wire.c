@@ -1,4 +1,11 @@
-/* wire.c — SCC channel A (the guest's /dev/tty51) on a host endpoint.
+/* wire.c — an SCC channel on a host endpoint.
+ *
+ * There are WIRE_MAX independently-attachable serial ports (see emu.h's
+ * SERIAL PORT TABLE): the motherboard SCC's channel A, which is what --wire
+ * has always meant and is still port 1, and the LR board's four.  Each holds
+ * its own socket, its own read buffer and its own trace flag; the un-indexed
+ * wire_open/wire_poll_char/wire_put_char below are exactly the old entry
+ * points, hard-wired to port 1, so nothing that used them has changed.
  *
  * The console is channel B; this is the machine's SECOND RS-232 port, and it is
  * the line /etc/rc.net attaches SLIP to.  Two emulators whose channel A meets
@@ -32,23 +39,42 @@
 #define MSG_NOSIGNAL 0        /* elsewhere SIGPIPE is disarmed in wire_open() */
 #endif
 
-static int     g_wire = -1;
-static bool    g_trace;
-static uint8_t g_buf[8192];
-static int     g_len, g_pos;
+/* One host endpoint per modelled port.  Ports are numbered as emu.h's table
+ * numbers them; index 0 is the console (never wired) and stays unused so a
+ * port number can be used as an index without arithmetic at every call site. */
+typedef struct {
+    int     fd;
+    bool    trace;
+    uint8_t buf[8192];
+    int     len, pos;
+} WireEnd;
+
+static WireEnd g_end[WIRE_MAX];
+static bool    g_init;
+
+static WireEnd *end_of(int port){
+    if (!g_init) {                       /* -1 is "closed"; 0 is a real fd */
+        for (int i = 0; i < WIRE_MAX; i++) g_end[i].fd = -1;
+        g_init = true;
+    }
+    if (port < 0 || port >= WIRE_MAX) return NULL;
+    return &g_end[port];
+}
 
 /* Hexdump one direction of the wire.  Not a debug leftover: this is the only
  * place the link can be seen as bytes, and a wire carrying nothing looks
  * exactly like a guest that never transmitted without it. */
-static void trace_bytes(const char *dir, const uint8_t *p, int n){
-    fprintf(stderr, "[wire %s %d]", dir, n);
+static void trace_bytes(int port, const char *dir, const uint8_t *p, int n){
+    fprintf(stderr, "[wire%d %s %d]", port, dir, n);
     for (int i = 0; i < n; i++) fprintf(stderr, " %02X", p[i]);
     fprintf(stderr, "\n");
 }
 
-int wire_open(const char *spec, bool trace){
+int wire_open_n(int port, const char *spec, bool trace){
     const char *path = spec;
     struct sockaddr_un sa;
+    WireEnd *e = end_of(port);
+    if (!e) { fprintf(stderr, "--wire: no such port %d\n", port); return -1; }
     if (!strncmp(spec, "unix:", 5)) path = spec + 5;
     if (strlen(path) >= sizeof sa.sun_path) {
         fprintf(stderr, "--wire: path too long: %s\n", path);
@@ -67,8 +93,8 @@ int wire_open(const char *spec, bool trace){
         if (connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0) {
             int fl = fcntl(fd, F_GETFL);
             fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-            g_wire = fd;
-            g_trace = trace;
+            e->fd = fd;
+            e->trace = trace;
             return 0;
         }
         close(fd);
@@ -80,44 +106,74 @@ int wire_open(const char *spec, bool trace){
 }
 
 void wire_close(void){
-    if (g_wire >= 0) { close(g_wire); g_wire = -1; }
+    for (int i = 0; i < WIRE_MAX; i++) {
+        WireEnd *e = end_of(i);
+        if (e && e->fd >= 0) { close(e->fd); e->fd = -1; }
+    }
 }
 
 /* One received byte, or -1 when the wire has nothing waiting.  Reads are
  * buffered: the run loop asks for a byte only as the guest's receiver empties,
  * and a recv() per byte at that rate is most of the cost of running attached. */
-int wire_poll_char(void){
-    if (g_wire < 0) return -1;
-    if (g_pos >= g_len) {
-        int n = (int)recv(g_wire, g_buf, sizeof g_buf, 0);
+int wire_poll_char_n(int port){
+    WireEnd *e = end_of(port);
+    if (!e || e->fd < 0) return -1;
+    if (e->pos >= e->len) {
+        int n = (int)recv(e->fd, e->buf, sizeof e->buf, 0);
         if (n <= 0) return -1;                  /* nothing ready, or peer gone */
-        if (g_trace) trace_bytes("in ", g_buf, n);
-        g_len = n; g_pos = 0;
+        if (e->trace) trace_bytes(port, "in ", e->buf, n);
+        e->len = n; e->pos = 0;
     }
-    return g_buf[g_pos++];
+    return e->buf[e->pos++];
 }
 
 /* Send one transmitted byte.  A full socket buffer drops the byte rather than
  * stalling the machine: the modelled transmitter is always empty, so the only
  * thing that can back up here is the host, and a real line drops too when the
  * far end has stopped listening. */
-void wire_put_char(int ch){
+void wire_put_char_n(int port, int ch){
     uint8_t b = (uint8_t)ch;
-    if (g_wire < 0) return;
-    if (g_trace) trace_bytes("out", &b, 1);
-    while (send(g_wire, &b, 1, MSG_NOSIGNAL) < 0 && errno == EINTR)
+    WireEnd *e = end_of(port);
+    if (!e || e->fd < 0) return;
+    if (e->trace) trace_bytes(port, "out", &b, 1);
+    while (send(e->fd, &b, 1, MSG_NOSIGNAL) < 0 && errno == EINTR)
         ;
+}
+
+/* --selftest support.  A socketpair rather than a bound path: the test needs
+ * both ends and no filesystem, and the emulator's end goes through exactly the
+ * buffering and non-blocking recv() a real --wire endpoint does. */
+int wire_test_pair(int port, int *host_fd){
+    int sv[2];
+    WireEnd *e = end_of(port);
+    if (!e) return -1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    for (int i = 0; i < 2; i++) {
+        int fl = fcntl(sv[i], F_GETFL);
+        fcntl(sv[i], F_SETFL, fl | O_NONBLOCK);
+    }
+    if (e->fd >= 0) close(e->fd);
+    e->fd = sv[0]; e->trace = false; e->len = e->pos = 0;
+    *host_fd = sv[1];
+    return 0;
 }
 
 #else   /* no AF_UNIX sockets here */
 
-int  wire_open(const char *spec, bool trace){
-    (void)spec; (void)trace;
+int  wire_open_n(int port, const char *spec, bool trace){
+    (void)port; (void)spec; (void)trace;
     fprintf(stderr, "--wire is not supported on this host\n");
     return -1;
 }
 void wire_close(void){}
-int  wire_poll_char(void){ return -1; }
-void wire_put_char(int ch){ (void)ch; }
+int  wire_poll_char_n(int port){ (void)port; return -1; }
+void wire_put_char_n(int port, int ch){ (void)port; (void)ch; }
+int  wire_test_pair(int port, int *host_fd){ (void)port; (void)host_fd; return -1; }
 
 #endif
+
+/* The original, un-indexed entry points.  --wire has always meant the
+ * motherboard SCC's channel A, so these are that port and nothing else. */
+int  wire_open(const char *spec, bool trace){ return wire_open_n(SERPORT_MB_A, spec, trace); }
+int  wire_poll_char(void){ return wire_poll_char_n(SERPORT_MB_A); }
+void wire_put_char(int ch){ wire_put_char_n(SERPORT_MB_A, ch); }

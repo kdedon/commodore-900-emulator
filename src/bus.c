@@ -85,6 +85,28 @@ void phys_write16(Machine *m, uint32_t a, uint16_t v){
 /* Receive interrupt pending on a channel: a character is waiting and that
  * channel has Rx interrupts enabled (WR1 D4:D3 != 0) with the master interrupt
  * enable set (WR9 D3 MIE, one physical register for both channels). */
+/* The SCC channel a SERIAL PORT TABLE port number names.  Ports 2..5 are on
+ * the LR board and answer only when that board is fitted; asking for one that
+ * is not there gets NULL rather than a channel that quietly exists. */
+SCCChan *scc_port(Machine *m, int port){
+    switch (port) {
+    case SERPORT_CONSOLE: return &m->scc_b;
+    case SERPORT_MB_A:    return &m->scc_a;
+    default:
+        if (port < SERPORT_LR_FIRST || port >= SCC_PORTS) return NULL;
+        if (!m->lr_scc) return NULL;
+        return &m->lr_scc_chan[port - SERPORT_LR_FIRST];
+    }
+}
+
+/* (chip, chan) -> channel, for the I/O decode.  chip 0 is the motherboard
+ * U74, 1 and 2 are the LR board's U31 and U36; chan 1 is A (address bit 5
+ * high), chan 0 is B.  Port numbers follow: chip 0 gives ports 0 and 1, chip
+ * 1 ports 2 and 3, chip 2 ports 4 and 5. */
+static SCCChan *scc_chan_of(Machine *m, int chip, int chan){
+    return scc_port(m, chip * 2 + chan);
+}
+
 static bool scc_rx_int(SCCChan *ch){
     if (!(ch->wr[9] & 0x08)) return false;  /* WR9 D3 MIE */
     if (!ch->rx_avail)       return false;
@@ -98,24 +120,34 @@ static bool scc_rxa_int(Machine *m){ return scc_rx_int(&m->scc_a); }
  * (status-high).  Ch B Rx Available is 010, Ch A Rx Available is 110 — the
  * same order the al(4) driver's setivec table assumes (vec+4 = Ch B receive,
  * vec+12 = Ch A receive). */
-static uint8_t scc_vector_src(Machine *m, uint8_t src){
-    uint8_t base = m->scc_b.wr[2];
-    if (m->scc_b.wr[9] & 0x10)               /* WR9 D4: Status High */
+static uint8_t scc_vector_chip(Machine *m, int chip, uint8_t src){
+    SCCChan *b = scc_chan_of(m, chip, 0);
+    if (!b) return 0;
+    uint8_t base = b->wr[2];
+    if (b->wr[9] & 0x10)                     /* WR9 D4: Status High */
         return (uint8_t)((base & ~0x70) | (src << 4));
     return (uint8_t)((base & ~0x0E) | (src << 1));
 }
+/* The motherboard chip, which is the only one the pre-existing callers meant. */
+static uint8_t scc_vector_src(Machine *m, uint8_t src){
+    return scc_vector_chip(m, 0, src);
+}
 /* The vector a Ch-B RR2 read returns: whichever source is currently pending,
  * or the bare base when none is. */
-static uint8_t scc_vector(Machine *m){
-    if (scc_rxa_int(m)) return scc_vector_src(m, 0x06);
-    if (scc_rxb_int(m)) return scc_vector_src(m, 0x02);
-    return m->scc_b.wr[2];
+static uint8_t scc_vector_of(Machine *m, int chip){
+    SCCChan *a = scc_chan_of(m, chip, 1), *b = scc_chan_of(m, chip, 0);
+    if (!a || !b) return 0;
+    if (scc_rx_int(a)) return scc_vector_chip(m, chip, 0x06);
+    if (scc_rx_int(b)) return scc_vector_chip(m, chip, 0x02);
+    return b->wr[2];
 }
 
 /* RR3 (read on channel A) exposes the interrupt-pending bits.  D5 = Ch A Rx IP,
  * D2 = Ch B Rx IP. */
-static uint8_t scc_rr3(Machine *m){
-    return (uint8_t)((scc_rxa_int(m) ? 0x20 : 0) | (scc_rxb_int(m) ? 0x04 : 0));
+static uint8_t scc_rr3_of(Machine *m, int chip){
+    SCCChan *a = scc_chan_of(m, chip, 1), *b = scc_chan_of(m, chip, 0);
+    if (!a || !b) return 0;
+    return (uint8_t)((scc_rx_int(a) ? 0x20 : 0) | (scc_rx_int(b) ? 0x04 : 0));
 }
 
 /* The C900's SCC is a Z8030 (Z-Bus).  Register addressing is a hybrid: the
@@ -123,8 +155,10 @@ static uint8_t scc_rr3(Machine *m){
  * register pointer (ch->ptr, set via a WR0 write) is non-zero, in which case it
  * overrides for this one access and then auto-resets.  chan=1 → Channel A
  * (AD5 high, scc_a), chan=0 → Channel B (the console, scc_b). */
-static uint8_t scc_read(Machine *m, int chan, int addrReg){
-    SCCChan *ch = chan ? &m->scc_a : &m->scc_b;
+static uint8_t scc_read(Machine *m, int chip, int chan, int addrReg){
+    SCCChan *ch = scc_chan_of(m, chip, chan);
+    if (!ch) return 0;
+    bool console = (chip == 0 && chan == 0);
     int r = ch->ptr ? ch->ptr : (addrReg & 0x0F);
     ch->ptr = 0;
     switch (r) {
@@ -137,7 +171,7 @@ static uint8_t scc_read(Machine *m, int chan, int addrReg){
          * while an output path checks it at most once per printed
          * character.  Scripted input and the idle exit both use the streak
          * to tell the two apart. */
-        if (chan == 0 && !ch->rx_avail) {
+        if (console && !ch->rx_avail) {
             m->rx_poll_streak++;
             if (m->rx_poll_streak >= RX_BLOCKED_POLLS) m->guest_polls = true;
         }
@@ -145,33 +179,46 @@ static uint8_t scc_read(Machine *m, int chan, int addrReg){
     }
     case 8:                           /* RR8 = Rx data (reading it clears rx) */
         ch->rx_avail = false;
-        if (chan == 0) {
+        if (console) {
             m->rx_poll_streak = 0;
             m->last_tx_insn = m->cpu.insns;   /* console activity: restart the quiet clock */
         }
         return ch->rx_data;
-    case 1: return 0x01;              /* RR1: all-sent, no errors */
-    case 2: return chan == 0 ? scc_vector(m) : ch->wr[2];  /* RR2 (Ch B): modified vector */
-    case 3: return chan == 1 ? scc_rr3(m) : 0;             /* RR3 (Ch A): IP bits */
+    /* RR1: All Sent, plus the error bits.  D5 is Rx Overrun, latched by a
+     * character shifted in over an unread one and cleared only by the Error
+     * Reset command -- see scc_rx_deliver.  Without --rx-overrun the bit is
+     * never set and this is the constant 0x01 it has always been. */
+    case 1: return (uint8_t)(0x01 | (ch->rx_overrun ? 0x20 : 0));
+    case 2: return chan == 0 ? scc_vector_of(m, chip) : ch->wr[2];  /* RR2 (Ch B): modified vector */
+    case 3: return chan == 1 ? scc_rr3_of(m, chip) : 0;             /* RR3 (Ch A): IP bits */
     default: return ch->wr[r & 0x0F];
     }
 }
-static void scc_write(Machine *m, int chan, int addrReg, uint8_t v){
-    SCCChan *ch = chan ? &m->scc_a : &m->scc_b;
+static void scc_write(Machine *m, int chip, int chan, int addrReg, uint8_t v){
+    SCCChan *ch = scc_chan_of(m, chip, chan);
+    if (!ch) return;
+    bool console = (chip == 0 && chan == 0);
+    int port = chip * 2 + chan;
     int r = ch->ptr ? ch->ptr : (addrReg & 0x0F);
     ch->ptr = 0;
     if (r == 0) {                            /* WR0: command + register pointer */
         uint8_t ptr = v & 0x07;
         uint8_t cmd = (v >> 3) & 0x07;
         ch->ptr = (cmd == 1) ? (ptr | 0x08) : ptr;  /* cmd 1 = Point High (+8) */
-        /* Commands 2-7 (reset ext/status, arm-rx-int, reset-Tx-IP, error-reset,
-         * reset-highest-IUS) have no state we model — we fire the Rx interrupt
-         * directly off rx_avail and don't track IUS. */
+        /* Command 6 is Error Reset, which unlatches the RR1 error bits -- the
+         * only one of commands 2-7 with state here.  The rest (reset
+         * ext/status, arm-rx-int, reset-Tx-IP, reset-highest-IUS) still have
+         * none: we fire the Rx interrupt directly off rx_avail and don't
+         * track IUS. */
+        if (cmd == 6) ch->rx_overrun = false;
         return;
     }
     if (r == 8) {                            /* WR8 = Tx data */
-        if (chan == 1) wire_put_char(v);     /* channel A → the host endpoint */
-        if (chan == 0) {
+        /* Every port but the console transmits onto its own host endpoint, if
+         * one is attached; port 1 through a wired endpoint is byte-for-byte
+         * what --wire has always done. */
+        if (!console && m->wire_port_on[port]) wire_put_char_n(port, v);
+        if (console) {
             console_put_char(v);
             m->last_tx_insn = m->cpu.insns;
             m->rx_poll_streak = 0;
@@ -205,18 +252,84 @@ static void scc_write(Machine *m, int chan, int addrReg, uint8_t v){
     }
     ch->wr[r] = v;
     /* WR2 (vector) and WR9 (master int control) are single physical registers
-     * shared by both channels — keep our two structs coherent. */
-    if (r == 2 || r == 9) { m->scc_a.wr[r] = v; m->scc_b.wr[r] = v; }
+     * shared by both channels OF ONE CHIP — keep that chip's two structs
+     * coherent, and only that chip's: al.c gives each SCC its own vector
+     * (VECTOR 0x10, +16 per chip, al.c:238,251-262), so leaking a WR2 write
+     * across chips would hand every board the same vector. */
+    if (r == 2 || r == 9) {
+        SCCChan *o = scc_chan_of(m, chip, chan ^ 1);
+        if (o) o->wr[r] = v;
+    }
+}
+
+/* Highest-priority pending Rx interrupt among the LR board's channels, if
+ * any: within a chip channel A outranks channel B, and U31 outranks U36. */
+static bool lr_scc_vi(Machine *m, uint16_t *vec){
+    for (int chip = 1; chip <= 2; chip++) {
+        SCCChan *a = scc_chan_of(m, chip, 1), *b = scc_chan_of(m, chip, 0);
+        if (a && scc_rx_int(a)) { *vec = scc_vector_chip(m, chip, 0x06); return true; }
+        if (b && scc_rx_int(b)) { *vec = scc_vector_chip(m, chip, 0x02); return true; }
+    }
+    return false;
+}
+
+/* Which SCC an I/O port lands in, or -1 for none.  Each chip is decoded on
+ * its own 0x80 page and so mirrors once in the upper half, which is the shape
+ * the motherboard SCC has always had here; A7 is what separates U31 from U36
+ * (`planning/PLA_REVERSE_ENGINEERING.md:159-161`). */
+static int scc_chip_at(Machine *m, uint16_t port){
+    if ((port & 0xFF80) == 0x0100) return 0;          /* U74, motherboard */
+    if (!m->lr_scc) return -1;
+    if ((port & 0xFF80) == 0x0300) return 1;          /* U31, LR board */
+    if ((port & 0xFF80) == 0x0380) return 2;          /* U36, LR board */
+    return -1;
+}
+
+/* Hand one byte to a receiver.
+ *
+ * The real Z8030 shifts the character in whether or not the CPU has read the
+ * last one; the old one is gone and RR1 D5 (Rx Overrun) latches until an
+ * Error Reset.  That is what --rx-overrun models.  Without it the caller
+ * never offers a byte to a full receiver in the first place (the run loop
+ * gates on rx_avail), which is why this emulator has never been able to lose
+ * a character -- and why an interrupt-driven receive ring has been
+ * indistinguishable from a polled read. */
+static void scc_rx_deliver(Machine *m, SCCChan *ch, uint8_t b){
+    if (ch->rx_avail && m->rx_overrun_on) { ch->rx_overrun = true; ch->rx_lost++; }
+    ch->rx_data = b; ch->rx_avail = true;
 }
 
 /* deliver a byte to the console channel B receiver */
 void scc_rx_console(Machine *m, uint8_t b){
-    m->scc_b.rx_data = b; m->scc_b.rx_avail = true;
+    scc_rx_deliver(m, &m->scc_b, b);
 }
 
 /* deliver a byte to the channel A receiver (the second RS-232 port, /dev/tty51) */
 void scc_rx_wire(Machine *m, uint8_t b){
-    m->scc_a.rx_data = b; m->scc_a.rx_avail = true;
+    scc_rx_deliver(m, &m->scc_a, b);
+}
+
+/* One pass of the wired receivers: offer each wired port its next host byte.
+ * This is the whole receive gate, and it is a function rather than run-loop
+ * text so that --selftest exercises the real thing and not a copy of it. */
+void scc_wire_service(Machine *m){
+    for (int port = SERPORT_MB_A; port < SCC_PORTS; port++) {
+        if (!m->wire_port_on[port]) continue;
+        SCCChan *ch = scc_port(m, port);
+        if (!ch) continue;
+        /* The gate.  Off (the default), a full receiver is left alone and the
+         * host endpoint keeps the byte, so nothing is ever lost.  On, the byte
+         * is taken anyway and the unread one is destroyed. */
+        if (ch->rx_avail && !m->rx_overrun_on) continue;
+        int wb = wire_poll_char_n(port);
+        if (wb >= 0) scc_rx_deliver(m, ch, (uint8_t)wb);
+    }
+}
+
+/* deliver a byte to any port's receiver, by SERIAL PORT TABLE number */
+void scc_rx_port(Machine *m, int port, uint8_t b){
+    SCCChan *ch = scc_port(m, port);
+    if (ch) scc_rx_deliver(m, ch, b);
 }
 
 /* ─────────────── HDC/FDC command-block processing (doorbell) ───────────────
@@ -602,11 +715,17 @@ uint16_t io_read(Machine *m, uint16_t port, bool is_byte, bool special){
         }
         return 0;
     }
-    /* SCC 0x0100-0x017F, on D15:D8 */
-    if ((port & 0xFF80) == 0x0100) {
-        int reg = (port >> 1) & 0x0F;
-        int chan = (port >> 5) & 1;           /* 1→A, 0→B */
-        return (uint16_t)scc_read(m, chan, reg) << 8;
+    /* SCC, on D15:D8.  Motherboard U74 at 0x0100-0x017F; the LR board's U31
+     * at 0x0300-0x037F and U36 at 0x0380-0x03FF, present only when the board
+     * is fitted (see emu.h's SERIAL PORT TABLE).  With no LR board these
+     * addresses fall through to the floating 0 they always returned. */
+    {
+        int chip = scc_chip_at(m, port);
+        if (chip >= 0) {
+            int reg = (port >> 1) & 0x0F;
+            int chan = (port >> 5) & 1;       /* 1→A, 0→B */
+            return (uint16_t)scc_read(m, chip, chan, reg) << 8;
+        }
     }
     /* CIO #1 0x0000-0x007F — plain register file (read back what was written).
      * In reset all regs read 0 except MICR. */
@@ -634,11 +753,14 @@ void io_write(Machine *m, uint16_t port, uint16_t data, bool is_byte, bool speci
         if (low == 0xFC || low == 0xF8) mmu_cmd_write(&m->mmu, (uint8_t)(port>>8), (uint8_t)data);
         return;
     }
-    if ((port & 0xFF80) == 0x0100) {          /* SCC (D15:D8) */
-        int reg = (port >> 1) & 0x0F;
-        int chan = (port >> 5) & 1;
-        scc_write(m, chan, reg, (uint8_t)(data >> 8));
-        return;
+    {                                         /* SCC (D15:D8) */
+        int chip = scc_chip_at(m, port);
+        if (chip >= 0) {
+            int reg = (port >> 1) & 0x0F;
+            int chan = (port >> 5) & 1;
+            scc_write(m, chip, chan, reg, (uint8_t)(data >> 8));
+            return;
+        }
     }
     if ((port & 0xFF80) == 0x0000) {          /* CIO #1 */
         int reg = (port >> 1) & 0x3F;
@@ -884,15 +1006,19 @@ void machine_run(Machine *m){
             }
         }
 
-        /* Channel A receiver: take the next byte from the host endpoint only
-         * once the guest has read the previous one.  The real chip has a
-         * three-deep FIFO and a byte arriving faster than the driver services
-         * the Rx interrupt is simply lost; here the endpoint holds it instead,
-         * so the wire cannot overrun the guest and SLIP frames arrive whole. */
-        if (m->wire_on && !m->scc_a.rx_avail && (m->tick_counter & 0x3F) == 0) {
-            int wb = wire_poll_char();
-            if (wb >= 0) scc_rx_wire(m, (uint8_t)wb);
-        }
+        /* Wired receivers.  By default, take the next byte from a host
+         * endpoint only once the guest has read the previous one: the real
+         * chip has a three-deep FIFO and a byte arriving faster than the
+         * driver services the Rx interrupt is simply lost, but here the
+         * endpoint holds it instead, so the wire cannot overrun the guest and
+         * SLIP frames arrive whole.  --rx-overrun drops that gate for the
+         * wires (never for the console, whose pacing is a separate machine
+         * above) so a receive ring can be told from a polled read by whether
+         * it loses characters.
+         *
+         * The loop is skipped entirely when nothing is wired, so a run with no
+         * --wire executes exactly the instructions it did before. */
+        if (m->any_wire && (m->tick_counter & 0x3F) == 0) scc_wire_service(m);
 
         m->tick_counter++;
         /* CIO #1 CT3 down-counter in continuous mode = the 100 Hz system tick.
@@ -921,6 +1047,13 @@ void machine_run(Machine *m){
             c->vi_line = true; c->vi_vector = scc_vector_src(m, 0x06); m->last_vi_disk = false;
         } else if (scc_int) {
             c->vi_line = true; c->vi_vector = scc_vector_src(m, 0x02); m->last_vi_disk = false;
+        } else if (m->lr_scc && lr_scc_vi(m, &c->vi_vector)) {
+            /* The LR board's chips, after the motherboard's and before the
+             * disk.  Where the LR board actually sits in the board-level daisy
+             * chain is not established anywhere I could find, so this order is
+             * a choice, not a finding -- but with no LR board fitted (the
+             * default) the branch is never taken and nothing above it moves. */
+            c->vi_line = true; m->last_vi_disk = false;
         } else if (m->disk_vi) {
             c->vi_line = true; c->vi_vector = 0x80; m->last_vi_disk = true;
         } else {

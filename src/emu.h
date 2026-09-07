@@ -248,7 +248,54 @@ typedef struct {
                             * auto-resets (set by a WR0 write; see scc_read/write) */
     bool     rx_avail;     /* a received byte is waiting in rx_data */
     uint8_t  rx_data;      /* last byte delivered to this channel's receiver */
+    /* Rx Overrun (RR1 D5).  The real Z8030 latches this when a character is
+     * shifted in over one the CPU has not read, and holds it until the Error
+     * Reset command (WR0 D5:D3 = 110).  Set only when --rx-overrun asked for
+     * a receiver that can lose a character; without it this is always false
+     * and RR1 reads exactly as it always has. */
+    bool     rx_overrun;
+    uint64_t rx_lost;      /* characters this receiver dropped (reported at exit) */
 } SCCChan;
+
+/* ───────────────────────── SERIAL PORT TABLE ─────────────────────────
+ * The C900 carries THREE Z8030 SCCs, six RS-232 ports.  The map is not an
+ * inference: it is the port table of COHERENT's own async line driver,
+ * `sys/z8001/drv/al.c:162-169` (`altty[]`), whose `NSCC 3` / `NMINOR 6` /
+ * `VECTOR 0x10` are at `al.c:31-34`.  The LR board's two chips are U31 and
+ * U36 (`planning/LR_BOARD_SCHEMATIC.md:83-88,349-350`); U36's socket is empty
+ * on the inventoried board but the schematic provisions it, so both are
+ * modelled and both are absent unless asked for.
+ *
+ *   port  address  chip                         what it is
+ *   ----  -------  ---------------------------  --------------------------
+ *     0    0x0100  motherboard SCC (U74) chan B  the ROM's serial CONSOLE
+ *     1    0x0120  motherboard SCC (U74) chan A  the one spare motherboard
+ *                                                port, the guest's
+ *                                                /dev/tty51 — this is what
+ *                                                --wire has always meant
+ *     2    0x0300  LR SCC #1 (U31) chan B        rear DB25 CN3
+ *     3    0x0320  LR SCC #1 (U31) chan A        rear DB25 CN4
+ *     4    0x0380  LR SCC #2 (U36) chan B        internal header CN5
+ *     5    0x03A0  LR SCC #2 (U36) chan A        internal header CN6
+ *
+ * Within a chip's block, bit 5 of the port selects the channel (1 -> A) and
+ * bits 4:1 select the register, exactly as the motherboard SCC already
+ * decodes (see scc_read/scc_write).  A7 selects U31 from U36 within the
+ * 0x0300 page (`planning/PLA_REVERSE_ENGINEERING.md:159-161`); which PLA term
+ * does that is still open there, so each chip is decoded on its 0x80 page and
+ * mirrors in the upper half, the same shape the motherboard SCC already has.
+ *
+ * WHAT IS FIRM AND WHAT IS NOT: the six addresses, NSCC, NMINOR and the
+ * vector base are firm — they are read out of shipping kernel source.  The
+ * exact PLA equation that produces the LR chip select is NOT established
+ * (`LR_BOARD_SCHEMATIC.md:248,339-340` says "range derivation TBD"), so the
+ * mirroring above is modelled by analogy with the motherboard, not traced. */
+#define SCC_CHIPS      3            /* U74 (motherboard), U31, U36 (LR) */
+#define SCC_PORTS      6            /* two channels per chip */
+#define WIRE_MAX       SCC_PORTS
+#define SERPORT_CONSOLE 0           /* motherboard chan B — never wired */
+#define SERPORT_MB_A    1           /* motherboard chan A — plain --wire */
+#define SERPORT_LR_FIRST 2          /* ports 2..5 live on the LR board */
 
 /* Hard disk / floppy: flat file, one 512-byte sector per block */
 typedef struct {
@@ -294,7 +341,23 @@ struct Machine {
 
     SCCChan scc_b;       /* console channel (AD5=0) */
     SCCChan scc_a;       /* second channel */
+    /* The LR board's four ports, in SERIAL PORT TABLE order: index 0..3 are
+     * ports 2..5.  Modelled only when lr_scc is set; with it clear the 0x0300
+     * page is not decoded at all and reads there float back as 0, which is
+     * what this emulator did before these chips existed. */
+    SCCChan lr_scc_chan[SCC_PORTS - SERPORT_LR_FIRST];
+    bool    lr_scc;      /* the LR board's SCCs answer (--lr-scc) */
     bool    wire_on;     /* channel A is attached to a host endpoint (--wire) */
+    bool    wire_port_on[SCC_PORTS];   /* which ports have a host endpoint */
+    bool    any_wire;    /* any port at all is wired — keeps the run loop's
+                          * per-port scan out of an unwired run entirely */
+    /* Opt-in receiver overrun (--rx-overrun).  Off, the run loop refuses to
+     * take a byte off a wire until the guest has read the previous one, so a
+     * character can never be lost and an interrupt-driven receive ring is
+     * indistinguishable from a polled one.  On, the receiver behaves like the
+     * real chip: the new byte lands, the old one is gone, and RR1 D5 latches
+     * the overrun until an Error Reset. */
+    bool    rx_overrun_on;
 
     Disk disk;           /* hard disk, command block at hdc_cmdblk */
     Disk floppy;         /* optional floppy, command block at hdc_cmdblk+0x10 */
@@ -408,11 +471,28 @@ void     phys_write16(Machine *m, uint32_t addr, uint16_t v);
 uint16_t io_read(Machine *m, uint16_t port, bool is_byte, bool special);
 void     io_write(Machine *m, uint16_t port, uint16_t data, bool is_byte, bool special);
 
-/* channel-A wire glue (host endpoint, see wire.c) */
+/* Wire glue (host endpoints, see wire.c).  The indexed forms take a port
+ * number from the SERIAL PORT TABLE above; the three un-indexed ones are the
+ * original entry points and mean port 1 (the motherboard's channel A), which
+ * is what --wire has always attached. */
+int  wire_open_n(int port, const char *spec, bool trace);   /* 0 on success */
+int  wire_poll_char_n(int port);        /* returns byte or -1 */
+void wire_put_char_n(int port, int ch);
 int  wire_open(const char *spec, bool trace);   /* 0 on success */
 void wire_close(void);
 int  wire_poll_char(void);      /* returns byte or -1 */
 void wire_put_char(int ch);
+
+/* The SCC channel a port number names, or NULL for a port whose board is not
+ * fitted.  Defined in bus.c. */
+SCCChan *scc_port(Machine *m, int port);
+void     scc_wire_service(Machine *m);   /* one pass of the wired receivers */
+void     scc_rx_port(Machine *m, int port, uint8_t b);
+
+/* --selftest only: give a port a host endpoint that is the near end of a
+ * socketpair, and hand back the far end so the test can play the far machine.
+ * Returns -1 where AF_UNIX is not available, and the caller skips. */
+int  wire_test_pair(int port, int *host_fd);
 
 /* ── debugging instruments (src/debug.c; --break / --dump) ──
  * All opt-in: dbg_armed stays 0 until a --break is accepted, and the one test

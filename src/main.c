@@ -85,6 +85,148 @@ static void on_sigint(int s){ (void)s; if (g_m) g_m->stop = true; }
  * checks register results. Verifies decode + ALU + branch + memory paths. */
 int lout_layout_selftest(void);   /* uexec.c */
 
+/* ── The serial ports (run by --selftest) ───────────────────────────────────
+ * Three properties, none of which any other test in the tree can see:
+ *
+ *   1. the six ports of emu.h's SERIAL PORT TABLE are ADDRESSABLE and
+ *      INDEPENDENT -- a byte delivered to one appears at one address and at
+ *      no other, and a vector written to one chip does not reach another;
+ *   2. --wire still means port 1 and behaves as it always has;
+ *   3. --rx-overrun loses a character, and its absence does not.
+ *
+ * Property 3 goes through scc_wire_service(), which IS the run loop's receive
+ * gate, so what passes here is the code that runs in a real boot rather than a
+ * restatement of it. */
+
+/* An SCC register's I/O address: chan bit is address bit 5, register bits 4:1
+ * (see scc_read).  Chip bases are the table's: 0x0100, 0x0300, 0x0380. */
+static uint16_t sccaddr(int port, int reg){
+    static const uint16_t chipbase[SCC_CHIPS] = { 0x0100, 0x0300, 0x0380 };
+    return (uint16_t)(chipbase[port / 2] + ((port & 1) << 5) + (reg << 1));
+}
+static uint8_t sccrd(Machine *m, int port, int reg){
+    return (uint8_t)(io_read(m, sccaddr(port, reg), false, false) >> 8);
+}
+static void sccwr(Machine *m, int port, int reg, uint8_t v){
+    io_write(m, sccaddr(port, reg), (uint16_t)v << 8, false, false);
+}
+
+static int serial_selftest(void){
+    Machine *m = machine_new();
+    int ok = 1;
+    #define SFAIL(...) do { printf("serial FAIL: " __VA_ARGS__); ok = 0; } while (0)
+
+    /* (a) With no LR board fitted -- the default -- 0x0300 and 0x0380 are not
+     * decoded at all, and read back as the floating 0 they always did. */
+    if (m->lr_scc) SFAIL("LR SCCs are fitted by default\n");
+    if (io_read(m, 0x0300, false, false) != 0 || io_read(m, 0x0380, false, false) != 0)
+        SFAIL("0x0300/0x0380 answer with no LR board fitted\n");
+    if (scc_port(m, 2) || scc_port(m, 5)) SFAIL("LR ports exist with no LR board\n");
+
+    /* (b) Fitted, all six ports exist, are distinct, and port 1 is still the
+     * channel A that --wire has always attached. */
+    m->lr_scc = true;
+    for (int p = 0; p < SCC_PORTS; p++)
+        if (!scc_port(m, p)) SFAIL("port %d missing with the LR board fitted\n", p);
+    if (scc_port(m, 0) != &m->scc_b) SFAIL("port 0 is not the console channel\n");
+    if (scc_port(m, 1) != &m->scc_a) SFAIL("port 1 is not channel A (--wire's port)\n");
+    for (int a = 0; a < SCC_PORTS; a++)
+        for (int b = a + 1; b < SCC_PORTS; b++)
+            if (scc_port(m, a) == scc_port(m, b)) SFAIL("ports %d and %d alias\n", a, b);
+
+    /* (c) Per-chip registers.  al.c gives each SCC its own interrupt vector
+     * (VECTOR 0x10, +16 per chip), so a WR2 write must reach both channels of
+     * ITS chip and neither channel of any other. */
+    sccwr(m, 0, 2, 0x10); sccwr(m, 2, 2, 0x20); sccwr(m, 4, 2, 0x30);
+    if (scc_port(m,1)->wr[2] != 0x10) SFAIL("WR2 did not reach chip 0's other channel\n");
+    if (scc_port(m,3)->wr[2] != 0x20) SFAIL("WR2 did not reach chip 1's other channel\n");
+    if (scc_port(m,0)->wr[2] != 0x10 || scc_port(m,2)->wr[2] != 0x20 ||
+        scc_port(m,4)->wr[2] != 0x30) SFAIL("a WR2 write leaked between chips\n");
+
+    /* (d) Receiver independence: one byte per port, each seen only at its own
+     * address.  RR0 D0 is Rx Character Available; RR8 is the data. */
+    for (int p = 0; p < SCC_PORTS; p++) scc_rx_port(m, p, (uint8_t)('A' + p));
+    for (int p = 0; p < SCC_PORTS; p++)
+        if (!(sccrd(m, p, 0) & 0x01)) SFAIL("port %d shows no character waiting\n", p);
+    for (int p = 0; p < SCC_PORTS; p++) {
+        uint8_t got = sccrd(m, p, 8);
+        if (got != (uint8_t)('A' + p))
+            SFAIL("port %d read '%c', wanted '%c'\n", p, got, 'A' + p);
+    }
+    for (int p = 0; p < SCC_PORTS; p++)
+        if (sccrd(m, p, 0) & 0x01) SFAIL("port %d still shows a character after RR8\n", p);
+
+    /* (e) Only the addressed port receives.  Give port 3 a byte and require
+     * every other port to stay empty -- the property verify-conN needs. */
+    scc_rx_port(m, 3, 'q');
+    for (int p = 0; p < SCC_PORTS; p++) {
+        bool avail = (sccrd(m, p, 0) & 0x01) != 0;
+        if (avail != (p == 3)) SFAIL("port %d avail=%d after a byte to port 3\n", p, avail);
+    }
+    (void)sccrd(m, 3, 8);
+
+    /* (f) The wires, end to end through the real receive gate.  Ports 1, 3
+     * and 5 -- one on each chip -- get a host endpoint apiece. */
+    /* Guarded because the host-side end of the pair is read and written with
+     * POSIX read()/write(), which this file only has a declaration for off
+     * Windows -- where wire_test_pair would refuse anyway. */
+#ifndef _WIN32
+    int h1 = -1, h3 = -1, h5 = -1;
+    if (wire_test_pair(1, &h1) == 0 && wire_test_pair(3, &h3) == 0 &&
+        wire_test_pair(5, &h5) == 0) {
+        m->wire_port_on[1] = m->wire_port_on[3] = m->wire_port_on[5] = true;
+        m->any_wire = true;
+        if (write(h1, "a", 1) != 1 || write(h3, "c", 1) != 1 || write(h5, "e", 1) != 1)
+            SFAIL("could not write to the test wires\n");
+        scc_wire_service(m);
+        if (scc_port(m,1)->rx_data != 'a' || !scc_port(m,1)->rx_avail) SFAIL("port 1 wire byte lost\n");
+        if (scc_port(m,3)->rx_data != 'c') SFAIL("port 3 got '%c'\n", scc_port(m,3)->rx_data);
+        if (scc_port(m,5)->rx_data != 'e') SFAIL("port 5 got '%c'\n", scc_port(m,5)->rx_data);
+        if (scc_port(m,2)->rx_avail || scc_port(m,4)->rx_avail)
+            SFAIL("an unwired port received someone else's traffic\n");
+
+        /* Transmit goes out its own wire and no other. */
+        sccwr(m, 3, 8, 'Z');
+        char rb[4];
+        if (read(h3, rb, 1) != 1 || rb[0] != 'Z') SFAIL("port 3 transmit did not reach its wire\n");
+        if (read(h1, rb, 1) > 0 || read(h5, rb, 1) > 0) SFAIL("a transmit crossed to another wire\n");
+
+        /* OVERRUN OFF (the default): a second byte arrives while the first is
+         * unread.  The gate refuses it, the endpoint keeps it, nothing is
+         * lost -- which is exactly why a receive ring has been untestable. */
+        if (m->rx_overrun_on) SFAIL("--rx-overrun is on by default\n");
+        if (write(h1, "b", 1) != 1) SFAIL("could not write the second byte\n");
+        scc_wire_service(m);
+        if (scc_port(m,1)->rx_data != 'a') SFAIL("overrun off: the unread byte was overwritten\n");
+        if (scc_port(m,1)->rx_lost != 0) SFAIL("overrun off: a character was counted lost\n");
+        if (sccrd(m, 1, 1) != 0x01) SFAIL("overrun off: RR1 is not 0x01\n");
+
+        /* OVERRUN ON: the same second byte now lands, 'a' is gone, and RR1 D5
+         * latches until an Error Reset (WR0 command 6 = 0x30). */
+        m->rx_overrun_on = true;
+        scc_wire_service(m);
+        if (scc_port(m,1)->rx_data != 'b') SFAIL("overrun on: the byte did not arrive\n");
+        if (scc_port(m,1)->rx_lost != 1) SFAIL("overrun on: %llu characters lost, wanted 1\n",
+                                               (unsigned long long)scc_port(m,1)->rx_lost);
+        if (!(sccrd(m, 1, 1) & 0x20)) SFAIL("overrun on: RR1 D5 did not latch\n");
+        if (scc_port(m,3)->rx_overrun) SFAIL("an overrun latched on the wrong port\n");
+        sccwr(m, 1, 0, 0x30);                       /* WR0: Error Reset */
+        if (sccrd(m, 1, 1) & 0x20) SFAIL("Error Reset did not clear RR1 D5\n");
+
+        close(h1); close(h3); close(h5);
+        if (ok) printf("serial ports PASSED (6 addressable, independent; overrun on/off)\n");
+    } else {
+        printf("serial ports PASSED (no AF_UNIX here; wire checks skipped)\n");
+    }
+#else
+    if (ok) printf("serial ports PASSED (6 addressable, independent; wires need AF_UNIX)\n");
+#endif
+    #undef SFAIL
+    wire_close();
+    free(m->ram); free(m);
+    return ok;
+}
+
 static int selftest(void){
     Machine *m = machine_new();
     CPU *c = &m->cpu;
@@ -146,6 +288,9 @@ static int selftest(void){
      * program -- a wrong answer produces a program that runs and addresses
      * nothing, which is the hardest kind of failure to see from outside. */
     if (!lout_layout_selftest()) ok = 0;
+
+    /* The serial ports: the SERIAL PORT TABLE, the wires and the overrun. */
+    if (!serial_selftest()) ok = 0;
 
     free(m->ram); free(m);
     return ok ? 0 : 1;
@@ -220,7 +365,27 @@ static void usage(FILE *out, const char *prog){
         "  --wire=PATH      attach SCC channel A (the guest's /dev/tty51) to the\n"
         "                   AF_UNIX stream socket PATH, so two emulators joined\n"
         "                   through one bridge share a serial link\n"
-        "  --wire-trace     hexdump every byte crossing --wire to stderr\n"
+        "  --wire-trace     hexdump every byte crossing a wire to stderr\n"
+        "  --wireN=PATH     attach serial port N the same way, for N in 1..5.\n"
+        "                   The C900 has three Z8030 SCCs, six ports (the map is\n"
+        "                   COHERENT al.c's own altty[] table):\n"
+        "                     0  0x0100  motherboard chan B  the ROM console\n"
+        "                     1  0x0120  motherboard chan A  /dev/tty51 (= --wire)\n"
+        "                     2  0x0300  LR SCC #1 chan B    rear DB25 CN3\n"
+        "                     3  0x0320  LR SCC #1 chan A    rear DB25 CN4\n"
+        "                     4  0x0380  LR SCC #2 chan B    header CN5\n"
+        "                     5  0x03A0  LR SCC #2 chan A    header CN6\n"
+        "                   Port 0 is the console and is stdin/stdout, so there is\n"
+        "                   no --wire0.  Wiring 2..5 fits the LR board implicitly.\n"
+        "  --lr-scc         fit the LR board's two SCCs (ports 2-5) with no wire\n"
+        "                   attached.  Without this, and without a --wireN for one\n"
+        "                   of its ports, 0x0300-0x03FF is not decoded at all\n"
+        "  --rx-overrun     let a receiver LOSE a character: a byte arriving on a\n"
+        "                   wired port while the guest has not read the previous\n"
+        "                   one overwrites it and latches RR1 D5 (Rx Overrun)\n"
+        "                   until an Error Reset, as the real SCC does.  Off by\n"
+        "                   default, where the endpoint holds the byte instead and\n"
+        "                   nothing can ever be lost\n"
         "  --rtc=WHEN       seed the MSM58321 clock: \"host\" (default), \"none\"\n"
         "                   for a machine with no module fitted, or an explicit\n"
         "                   YYYY-MM-DDTHH:MM:SS (the module has no battery here)\n"
@@ -301,6 +466,8 @@ int main(int argc, char **argv){
      * Value options accept both "--opt=VALUE" and "--opt VALUE". */
     const char *fw = "../rom", *disk = "../disk/hdd.bin", *floppy = NULL, *g_input = NULL;
     const char *rtcseed = "host", *wire = NULL, *g_inmark = NULL;
+    const char *wireN[SCC_PORTS] = {0};   /* --wire1 .. --wire5, by port number */
+    bool lr_scc = false, rx_overrun = false;
     unsigned long long rtc_ips = 0;
     bool trace = false, dosel = false, wtrace = false;
     unsigned long long g_max = 0;
@@ -335,10 +502,24 @@ int main(int argc, char **argv){
         else if (!strcmp(argv[i],"--require-stop")) require_stop = true;
         else if ((v = opt_value(argv,argc,&i,"--wire")))     wire = v;
         else if (!strcmp(argv[i],"--wire-trace")) wtrace = true;
+        else if (!strcmp(argv[i],"--lr-scc")) lr_scc = true;
+        else if (!strcmp(argv[i],"--rx-overrun")) rx_overrun = true;
         else if (!strcmp(argv[i],"--trace")) trace = true;
         else if (!strcmp(argv[i],"--selftest")) dosel = true;
         else if (!strcmp(argv[i],"--help") || !strcmp(argv[i],"-h")) { usage(stdout, argv[0]); return 0; }
-        else { fprintf(stderr,"unknown arg: %s\n\n", argv[i]); usage(stderr, argv[0]); return 2; }
+        else {
+            /* --wireN=PATH for N in 1..5 (the SERIAL PORT TABLE's port
+             * numbers).  --wire1 is the same port as plain --wire; there is
+             * no --wire0 because port 0 is the console, which is stdin/stdout
+             * and cannot be handed to a socket. */
+            int matched = 0;
+            for (int p = SERPORT_MB_A; p < SCC_PORTS; p++) {
+                char opt[10];
+                snprintf(opt, sizeof opt, "--wire%d", p);
+                if ((v = opt_value(argv,argc,&i,opt))) { wireN[p] = v; matched = 1; break; }
+            }
+            if (!matched) { fprintf(stderr,"unknown arg: %s\n\n", argv[i]); usage(stderr, argv[0]); return 2; }
+        }
     }
 
     if (dosel) return selftest();
@@ -429,8 +610,25 @@ int main(int argc, char **argv){
     if (wire) {
         if (wire_open(wire, wtrace) != 0) return 1;
         m->wire_on = true;
+        m->wire_port_on[SERPORT_MB_A] = true;
         fprintf(stderr,"[c900: SCC channel A (/dev/tty51) on %s]\n", wire);
     }
+    /* The LR board is fitted if it was asked for, or implicitly if one of its
+     * ports was wired -- wiring a port on a board that is not there would be
+     * a silent no-op, and a silent no-op is the failure mode this whole task
+     * exists to remove. */
+    for (int p = SERPORT_LR_FIRST; p < SCC_PORTS; p++) if (wireN[p]) lr_scc = true;
+    m->lr_scc = lr_scc;
+    m->rx_overrun_on = rx_overrun;
+    for (int p = SERPORT_MB_A; p < SCC_PORTS; p++) {
+        if (!wireN[p]) continue;
+        if (m->wire_port_on[p]) { fprintf(stderr,"--wire%d: port %d is already wired\n", p, p); return 2; }
+        if (wire_open_n(p, wireN[p], wtrace) != 0) return 1;
+        m->wire_port_on[p] = true;
+        if (p == SERPORT_MB_A) m->wire_on = true;
+        fprintf(stderr,"[c900: SCC port %d on %s]\n", p, wireN[p]);
+    }
+    for (int p = 0; p < SCC_PORTS; p++) if (m->wire_port_on[p]) m->any_wire = true;
     signal(SIGINT, on_sigint);
 #ifdef _WIN32
     signal(SIGBREAK, on_sigint);   /* Ctrl-Break always signals regardless of console mode */
