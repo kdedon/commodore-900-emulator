@@ -194,6 +194,43 @@ static uint8_t scc_read(Machine *m, int chip, int chan, int addrReg){
     default: return ch->wr[r & 0x0F];
     }
 }
+/* One character of a console-output mark match, returning the new matched
+ * length.  A mismatch does not simply restart: it falls back to the longest
+ * prefix of the mark that is also a suffix of what has already matched, which
+ * is what lets a mark whose own prefix repeats be found at all.  Matching
+ * "aab" against "aaab" is the smallest case -- resetting to 0, or to 1 for a
+ * character equal to mark[0], walks straight past the match that is there.
+ * The fallback is computed from the MARK, so no history of the output has to
+ * be kept: what has matched so far is by definition mark[0..pos-1].
+ */
+static int mark_advance(const char *mark, int pos, uint8_t v){
+    for (;;) {
+        if ((uint8_t)mark[pos] == v) return pos + 1;
+        if (pos == 0) return 0;
+        int k = pos - 1;
+        while (k > 0 && memcmp(mark, mark + pos - k, (size_t)k) != 0) k--;
+        pos = k;
+    }
+}
+
+/* --stop-mark on one transmitted character.  Every SCC transmit path is
+ * watched, not the console alone: the mark is the guest saying "I am done",
+ * and a guest that says it on a wired port has said it just as plainly.  The
+ * match state is per PORT -- the ports are independent streams, and a single
+ * shared position would let a half-printed mark on one port be finished by
+ * bytes from another and end the run on text nothing ever printed.  Called
+ * AFTER the character has been handed on, so the transcript (or the wire)
+ * contains the mark that ended the run. */
+static void stop_mark_watch(Machine *m, int port, uint8_t v){
+    if (!m->stop_mark) return;
+    int *pos = &m->stop_mark_pos[port];
+    *pos = mark_advance(m->stop_mark, *pos, v);
+    if (m->stop_mark[*pos] == '\0') {
+        m->stop = true;
+        m->stop_why = "the guest printed the stop mark";
+    }
+}
+
 static void scc_write(Machine *m, int chip, int chan, int addrReg, uint8_t v){
     SCCChan *ch = scc_chan_of(m, chip, chan);
     if (!ch) return;
@@ -217,7 +254,12 @@ static void scc_write(Machine *m, int chip, int chan, int addrReg, uint8_t v){
         /* Every port but the console transmits onto its own host endpoint, if
          * one is attached; port 1 through a wired endpoint is byte-for-byte
          * what --wire has always done. */
-        if (!console && m->wire_port_on[port]) wire_put_char_n(port, v);
+        if (!console) {
+            if (m->wire_port_on[port]) wire_put_char_n(port, v);
+            /* A non-console port is watched for the stop mark whether or not a
+             * host endpoint is attached: the guest has printed it either way. */
+            stop_mark_watch(m, port, v);
+        }
         if (console) {
             console_put_char(v);
             m->last_tx_insn = m->cpu.insns;
@@ -228,13 +270,22 @@ static void scc_write(Machine *m, int chip, int chan, int addrReg, uint8_t v){
              * "send this the moment that appears" is what a person at the
              * terminal does, and unlike an instruction count it does not move
              * when the guest is rebuilt.  On a mismatch the match restarts at
-             * this same character, so a mark can begin with the byte that
-             * broke the previous attempt. */
+             * the longest prefix of the mark that is still matched, so a mark
+             * whose own prefix repeats is found where it occurs -- see
+             * mark_advance(). */
             if (m->inq_mark && !m->inq_mark_seen) {
-                if (v == (uint8_t)m->inq_mark[m->inq_mark_pos]) m->inq_mark_pos++;
-                else m->inq_mark_pos = (v == (uint8_t)m->inq_mark[0]) ? 1 : 0;
+                m->inq_mark_pos = mark_advance(m->inq_mark, m->inq_mark_pos, v);
                 if (m->inq_mark[m->inq_mark_pos] == '\0') m->inq_mark_seen = true;
             }
+            /* --stop-mark: the same match, ending the run instead of releasing
+             * type-ahead.  A test knows when it is done and can say so on the
+             * console it is already writing to, which is the deterministic end
+             * the doorbell gives without costing a program on the guest's disk
+             * or the privileged OUT a user-mode program cannot execute.  The
+             * character is handed to the console FIRST, so the transcript
+             * contains the mark that ended the run.  Unlike --input-mark this
+             * is not console-only -- see stop_mark_watch(). */
+            stop_mark_watch(m, port, v);
             /* Prompt characters gate scripted input: the Coherent shell
              * prompts with '#', the kboot menu with "boot> ", and CP/M's CCP
              * with "A>" -- so '#' or '>' latches input-ready and counts a
@@ -1279,6 +1330,101 @@ static void park_guest_printing(Machine *m, uint64_t i){ m->last_tx_insn = i; }
 /* (d) A guest that is simply RUNNING -- never halted at all.  The cheapest
  * thing to get wrong is a counter that advances when the CPU is up. */
 static void park_guest_running(Machine *m, uint64_t i){ (void)m; (void)i; }
+
+/* ── stop_mark_selftest (--selftest) ────────────────────────────────────────
+ *
+ * The mark is matched on the guest's console transmit path, so the check
+ * drives that path -- scc_write() of WR8 on chip 0 channel 0, which is what
+ * the guest executes to print a character -- rather than calling the matcher
+ * directly.  Three things have to hold: the run ends on the LAST character of
+ * the mark and not before, text that merely resembles the mark does not end
+ * it, and a restart mid-mark still matches (a mark may begin with the byte
+ * that broke the previous attempt, as "aab" does in "aaab").
+ */
+static int mark_case_on(const char *name, int chip, int chan, const char *mark,
+                        const char *feed, int expect_at, int *ok){
+    Machine *m = machine_new();
+    m->lr_scc = true;                /* so the LR board's channels answer too */
+    m->stop_mark = mark;
+    int fired_at = -1;
+    for (int i = 0; feed[i] && fired_at < 0; i++) {
+        scc_write(m, chip, chan, 8, (uint8_t)feed[i]);
+        if (m->stop) fired_at = i;
+    }
+    /* The fed text has just been printed through the real console path, which
+     * is what the case exercises; the verdict starts on its own line. */
+    if (fired_at != expect_at) {
+        printf("\nstop-mark FAIL: %s -- ended at %d, expected %d\n",
+               name, fired_at, expect_at);
+        *ok = 0;
+    } else if (expect_at < 0)
+        printf("\nstop mark %s PASSED (never ended)\n", name);
+    else
+        printf("\nstop mark %s PASSED (ended on the last character)\n", name);
+    free(m->ram); free(m);
+    return *ok;
+}
+/* The console is what nearly every case means, so it keeps the short name. */
+static int mark_case(const char *name, const char *mark, const char *feed,
+                     int expect_at, int *ok){
+    return mark_case_on(name, 0, 0, mark, feed, expect_at, ok);
+}
+
+/* Two channels printing at once must not help each other: each carries half of
+ * the mark, in an order that would complete it at once if the match position
+ * were shared.  Nothing may end the run -- neither channel ever printed the
+ * mark itself. */
+static void mark_case_crosstalk(const char *mark, const char *feed,
+                                int *ok){
+    Machine *m = machine_new();
+    m->lr_scc = true;
+    m->stop_mark = mark;
+    int fired_at = -1;
+    for (int i = 0; feed[i] && fired_at < 0; i++) {
+        /* alternate console (chip 0 chan 0) and the motherboard's other
+         * channel (chip 0 chan 1), a character each */
+        scc_write(m, 0, i & 1, 8, (uint8_t)feed[i]);
+        if (m->stop) fired_at = i;
+    }
+    if (fired_at >= 0) {
+        printf("\nstop-mark FAIL: two channels combined into a mark at %d\n",
+               fired_at);
+        *ok = 0;
+    } else
+        printf("\nstop mark crosstalk PASSED (channels never combined)\n");
+    free(m->ram); free(m);
+}
+
+int stop_mark_selftest(void){
+    int ok = 1;
+    /* Ends on the mark's last character, with output before and after it. */
+    mark_case("caught", "__DONE__", "# echo __DONE__\r\n", 14, &ok);
+    /* A prefix of the mark is not the mark. */
+    mark_case("prefix spared", "__DONE__", "__DONE and nothing more", -1, &ok);
+    /* A restart mid-match: the second 'a' begins the match the first broke. */
+    mark_case("restart", "aab", "aaab", 3, &ok);
+    /* The same, printed on channels that are NOT the console: a guest that
+     * reports on a serial port rather than its terminal ends its run too --
+     * the motherboard's second channel, and one on the LR board. */
+    mark_case_on("caught on port 1", 0, 1, "__DONE__", "# echo __DONE__\r\n", 14, &ok);
+    mark_case_on("caught on the LR board", 1, 0, "__DONE__", "junk__DONE__", 11, &ok);
+    mark_case_on("restart on port 1", 0, 1, "aab", "aaab", 3, &ok);
+    mark_case_on("prefix spared on port 1", 0, 1, "__DONE__", "__DONE and no more", -1, &ok);
+    /* Interleaved on two channels, alternating a character each: "__DONE__"
+     * split as "_DN_" on the console and "_OE_" on port 1.  A shared match
+     * position would see the mark in the merged stream and end the run. */
+    mark_case_crosstalk("__DONE__", "__DONE__", &ok);
+    /* Disarmed: no mark, no stop, however much the guest prints. */
+    {
+        Machine *m = machine_new();
+        m->stop_mark = NULL;
+        for (const char *s = "__DONE__"; *s; s++) scc_write(m, 0, 0, 8, (uint8_t)*s);
+        if (m->stop) { printf("\nstop-mark FAIL: fired with no mark set\n"); ok = 0; }
+        else printf("\nstop mark disarmed PASSED (never ended)\n");
+        free(m->ram); free(m);
+    }
+    return ok;
+}
 
 int park_selftest(void){
     int ok = 1;

@@ -442,6 +442,21 @@ struct Machine {
                              * budget is called parked while it is working correctly.  The
                              * channel is therefore selectable like every other, and a harness
                              * whose guest sleeps names its own channels instead */
+    const char *stop_mark;  /* --stop-mark: text whose PRINTING ends the run (NULL = disarmed).
+                             * The guest says when it is finished, in a channel every guest
+                             * already has -- a serial port it is already writing to -- so this
+                             * needs no program on the disk and no privileged I/O, unlike the
+                             * stop doorbell, and it truncates nothing, unlike --idle: the
+                             * moment is still the guest's, it is just announced in output
+                             * rather than on a port.  It is watched on EVERY SCC transmit
+                             * path, not the console alone, so a guest that reports on a wired
+                             * port can end its own run the same way */
+    int      stop_mark_pos[SCC_PORTS];
+                            /* how much of stop_mark each port's OWN output has matched.  The
+                             * state is per port because the ports are independent streams: one
+                             * shared counter would let half a mark printed on one port be
+                             * completed by bytes from another, ending the run on text that no
+                             * channel ever printed */
     const char *stop_why;   /* why the run ended, for the closing message and the exit status */
     bool     max_reached;   /* the run ended by exhausting --max rather than by stopping */
 

@@ -85,6 +85,7 @@ static void on_sigint(int s){ (void)s; if (g_m) g_m->stop = true; }
  * checks register results. Verifies decode + ALU + branch + memory paths. */
 int lout_layout_selftest(void);   /* uexec.c */
 int park_selftest(void);          /* bus.c */
+int stop_mark_selftest(void);     /* bus.c */
 
 /* ── The serial ports (run by --selftest) ───────────────────────────────────
  * Three properties, none of which any other test in the tree can see:
@@ -297,6 +298,9 @@ static int selftest(void){
      * and a guest that is getting somewhere never is. */
     if (!park_selftest()) ok = 0;
 
+    /* The stop mark: ends on the text the guest prints, and on nothing else. */
+    if (!stop_mark_selftest()) ok = 0;
+
     free(m->ram); free(m);
     return ok ? 0 : 1;
 }
@@ -349,7 +353,7 @@ static void usage(FILE *out, const char *prog){
         "                   would, and leaving no trace in it.  Repeatable\n"
         "  --stop-on=LIST   which early-stop channels are armed, comma-separated:\n"
         "                   \"idle\", \"port\" and \"park\" (the default is\n"
-        "                   \"port,park\"), \"break\", \"all\" or \"none\".\n"
+        "                   \"port,park\"), \"break\", \"mark\", \"all\" or \"none\".\n"
         "                   idle: for test harnesses, OFF unless asked for.  With\n"
         "                     --input, stop once every scripted byte has been fed\n"
         "                     and the guest is idle at a prompt: a prompt character\n"
@@ -358,6 +362,9 @@ static void usage(FILE *out, const char *prog){
         "                   port: stop when the guest writes the word 0xC900 to the\n"
         "                     --stop-port I/O port -- an explicit \"I am finished\"\n"
         "                     from the guest, so it cannot fire on its own\n"
+        "                   mark: stop when the guest PRINTS --stop-mark. Armed by\n"
+        "                     giving that text; naming it here without one is an\n"
+        "                     error rather than a channel that cannot fire\n"
         "                   break: stop once a --break has recorded its last hit,\n"
         "                     with that instruction NOT yet executed\n"
         "                   park: stop when the guest is halted, woken only by a\n"
@@ -370,6 +377,15 @@ static void usage(FILE *out, const char *prog){
         "                   for, and arms it (default 40000000)\n"
         "  --stop-port=P    the port channel's I/O port (default 0x0FFE, which\n"
         "                   nothing on the machine answers)\n"
+        "  --stop-mark=TEXT end the run when the guest PRINTS TEXT on ANY serial\n"
+        "                   channel, the console included (each channel matched on\n"
+        "                   its own output alone -- two channels never combine).\n"
+        "                   The guest picks the moment, as with the doorbell, so\n"
+        "                   nothing is truncated and nothing is waited out -- but\n"
+        "                   it announces it in output rather than on an I/O port,\n"
+        "                   so it needs no program on the guest's disk and no\n"
+        "                   privileged OUT. A harness that already echoes a\n"
+        "                   finished marker has one for free\n"
         "  --require-stop   exit 3 if the run ended by exhausting --max rather than\n"
         "                   by stopping, so a caller can assert that the session\n"
         "                   finished rather than merely that the emulator survived\n"
@@ -489,6 +505,7 @@ int main(int argc, char **argv){
      * running when its owner returns, however long the guest stays silent.
      * The port channel is, since only the guest itself can fire it. */
     const char *g_stopon = "port,park";
+    const char *g_stopmark = NULL;   /* --stop-mark: guest-announced end of run */
     bool idle_asked = false;             /* --idle=N given: tuning it asks for it */
     bool require_stop = false;
     for (int i=1;i<argc;i++){
@@ -504,6 +521,7 @@ int main(int argc, char **argv){
         else if ((v = opt_value(argv,argc,&i,"--idle")))   { g_idle = strtoull(v,0,0); idle_asked = true; }
         else if ((v = opt_value(argv,argc,&i,"--stop-port"))) g_stopport = strtoul(v,0,0);
         else if ((v = opt_value(argv,argc,&i,"--stop-on")))  g_stopon = v;
+        else if ((v = opt_value(argv,argc,&i,"--stop-mark"))) g_stopmark = v;
         else if ((v = opt_value(argv,argc,&i,"--break"))) {
             if (dbg_add_break(v)) { fprintf(stderr,"--break: expected SEG:OFF[/N] in hex, e.g. 32:3EAC or B200:3EAC/2\n"); return 2; }
         }
@@ -575,23 +593,36 @@ int main(int argc, char **argv){
     /* --stop-on selects the channels; --idle and --stop-port only tune them.
      * Disarming a channel zeroes the field its run-loop test reads, so a
      * disarmed channel costs nothing and cannot fire. */
-    bool on_idle, on_port, on_break, on_park;
-    if (!strcmp(g_stopon,"none"))       on_idle = on_port = on_break = on_park = false;
-    else if (!strcmp(g_stopon,"all"))   on_idle = on_port = on_break = on_park = true;
+    bool on_idle, on_port, on_break, on_mark, on_park;
+    /* An empty --stop-mark is no mark: it would match instantly and end the run
+     * before the guest had printed anything, which reads as "stop at once"
+     * rather than as the mistake it is. */
+    bool mark_asked = g_stopmark && *g_stopmark;
+    if (!strcmp(g_stopon,"none"))       on_idle = on_port = on_break = on_mark = on_park = false;
+    else if (!strcmp(g_stopon,"all"))   on_idle = on_port = on_break = on_mark = on_park = true;
     else {
         on_idle = strstr(g_stopon,"idle") != NULL || idle_asked;
         on_port = strstr(g_stopon,"port") != NULL;
         on_break = strstr(g_stopon,"break") != NULL;
         on_park = strstr(g_stopon,"park") != NULL;
-        if (!on_idle && !on_port && !on_break && !on_park) {
+        /* Naming a mark arms its channel, as --idle arms idle: a caller who
+         * passed the text has said what it is for, and making them repeat it
+         * in --stop-on only creates a way to pass a mark that cannot fire. */
+        on_mark = strstr(g_stopon,"mark") != NULL || mark_asked;
+        if (!on_idle && !on_port && !on_break && !on_mark && !on_park) {
             fprintf(stderr,"--stop-on: expected a comma-separated list of "
-                           "idle, port, break and/or park, or all, or none\n");
+                           "idle, port, break, park and/or mark, or all, or none\n");
             return 2;
         }
+    }
+    if (on_mark && !mark_asked && strstr(g_stopon,"mark")) {
+        fprintf(stderr,"--stop-on=mark: no --stop-mark text to watch for\n");
+        return 2;
     }
     dbg_stop_at_break(on_break);
     m->idle_quiet = on_idle ? g_idle : 0;
     m->stop_port  = on_port ? (uint16_t)g_stopport : 0;
+    m->stop_mark  = (on_mark && mark_asked) ? g_stopmark : NULL;
     m->park_watch = on_park;
     m->inq_gateoff = -1;                 /* prompt gate applies throughout by default */
     /* An empty --input-mark is no mark: it would otherwise match instantly and
