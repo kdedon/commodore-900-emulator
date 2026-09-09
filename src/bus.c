@@ -905,6 +905,133 @@ int machine_attach_floppy(Machine *m, const char *path){
     return 0;
 }
 
+/* ── THE PARK WATCH: a halted guest that a periodic interrupt keeps waking ──
+ *
+ * The check at the bottom of the run loop ("the guest halted with no interrupt
+ * pending") sees a CPU that has stopped and has nothing left to restart it.  It
+ * is defeated by any periodic source at all.  With the CT3 tick running, a
+ * guest parked in kboot's
+ *
+ *      hang:   halt
+ *              jr      hang
+ *
+ * -- where crt.s leaves the machine when bmain() returns after an unrecoverable
+ * error, a bootinfo version refusal being the one that bit -- wakes on every
+ * tick, runs the interrupt path, falls back into `halt', and does that forever.
+ * `idle' is reset by each tick, so that check never fires; and because only a
+ * couple of instructions retire per tick, the instruction budget does not
+ * advance either.  Measured on this machine: ~24 M instructions/s while the
+ * loader was working, under 250/s once parked, so the suite's --max=600000000
+ * is about four weeks away.  An emulator sat in exactly this state for 16 h
+ * 47 min at 99% CPU before a person noticed.
+ *
+ * WHY THIS IS NOT A TIMEOUT.  A clock ends a run because it has been going a
+ * long time, which is why a default one was refused: a test that legitimately
+ * needs the emulator for hours is not doing anything wrong.  This ends a run
+ * because the guest is DEMONSTRABLY IN A CYCLE.  At every halt we take a
+ * signature of everything the guest could have changed in a way that matters --
+ * the whole register file, the PC, the flag/control word, the console
+ * activity stamp, how much scripted input has been handed over, how many
+ * prompts have been printed -- and the counter advances only while consecutive
+ * halts are BIT-FOR-BIT IDENTICAL.  A guest that prints one character, reads
+ * one byte, touches one register or halts anywhere else resets it and gets the
+ * full budget again, however long it has already been running.  So no run that
+ * is making progress can reach this bound, no matter how long it takes; a run
+ * that reaches it has provably been repeating itself.
+ *
+ * Nor is it a gate.  It ENDS a run, with a plain reason, exactly as the sibling
+ * check above it does -- it sets no failure, changes no exit status, and needs
+ * no flag.  A caller that judges a session by its transcript (the CP/M suite's
+ * tests/bootgate.sh does) gets the same verdict it gets today, and gets it in
+ * seconds instead of never.
+ *
+ * And it moves no instruments: it only READS state that already exists, on a
+ * path the guest cannot observe.  A run retires exactly the instructions it
+ * retired before. */
+
+/* Iterations of an unbroken, identical park before the run is called over.
+ * The sibling check uses 2,000,000 for a CPU with no wakeup at all, which is
+ * unambiguous the moment it is seen.  This wants more room, so it is 250x
+ * that: about twenty seconds of parked spinning on a current host, and
+ * unreachable for a guest whose registers or console traffic ever change. */
+#define PARK_LOOPS 500000000ull
+/* Consecutive non-halted iterations that count as the guest having WOKEN UP
+ * AND DONE SOMETHING, which throws the signature away rather than merely
+ * resetting the count.  A tick interrupt path is tens of instructions; this is
+ * three orders of magnitude more, so no service routine reaches it and no real
+ * stretch of work fails to. */
+#define PARK_AWAKE 100000ull
+
+typedef struct {
+    uint64_t budget;        /* PARK_LOOPS for a real run; the selftest uses a small one */
+    uint64_t loops;         /* iterations parked in an unbroken identical halt */
+    uint64_t awake;         /* consecutive iterations not halted */
+    bool     was_halted;    /* to catch the moment it halts, which is when we look */
+    bool     valid;         /* a signature has been taken */
+    /* the signature */
+    uint16_t R[16];
+    uint32_t pc;
+    uint16_t fcw;
+    uint64_t tx;            /* m->last_tx_insn: any console byte in or out moves it */
+    int      inq;           /* m->inq_pos: a scripted byte was handed over */
+    uint32_t seq;           /* m->prompt_seq: a prompt was printed */
+} ParkWatch;
+
+/* Clears the count and the signature.  The budget is the watch's setting, not
+ * part of its state, so it survives -- park_reset() is called mid-run. */
+static void park_reset(ParkWatch *p){
+    uint64_t b = p->budget; memset(p, 0, sizeof *p); p->budget = b;
+}
+static void park_init(ParkWatch *p, uint64_t budget){
+    memset(p, 0, sizeof *p); p->budget = budget;
+}
+
+/* Called once per run-loop iteration, after cpu_step().  Returns true when the
+ * run should end, having set m->stop_why. */
+static bool park_step(ParkWatch *p, Machine *m){
+    CPU *c = &m->cpu;
+
+    if (!c->halted) {
+        /* Woken.  A tick's interrupt path is a brief excursion and must not by
+         * itself clear the park -- if it did, one periodic source would hide a
+         * dead guest again, which is the whole bug.  A long stretch of running
+         * is different: that is a guest doing work, and the signature it left
+         * behind is stale. */
+        if (++p->awake > PARK_AWAKE) { uint64_t a = p->awake; park_reset(p); p->awake = a; }
+        p->was_halted = false;
+        return false;
+    }
+    p->awake = 0;
+
+    if (!p->was_halted) {                       /* the instant it (re)halted */
+        bool same = p->valid
+                 && c->pc  == p->pc
+                 && c->fcw == p->fcw
+                 && !memcmp(c->R, p->R, sizeof p->R)
+                 && m->last_tx_insn == p->tx
+                 && m->inq_pos      == p->inq
+                 && m->prompt_seq   == p->seq;
+        if (!same) {                            /* something moved: start over */
+            p->loops = 0;
+            p->valid = true;
+            memcpy(p->R, c->R, sizeof p->R);
+            p->pc = c->pc; p->fcw = c->fcw;
+            p->tx = m->last_tx_insn; p->inq = m->inq_pos; p->seq = m->prompt_seq;
+            if (getenv("C900_PARK_DEBUG"))
+                fprintf(stderr, "[park reset at pc=%06X insns=%llu]\n",
+                        c->pc, (unsigned long long)c->insns);
+        }
+    }
+    p->was_halted = true;
+
+    if (p->valid && ++p->loops > p->budget) {
+        m->stop_why = "the guest is parked: halted, woken only by a periodic "
+                      "interrupt, and doing nothing when woken";
+        return true;
+    }
+    return false;
+}
+
 void machine_run(Machine *m){
     CPU *c = &m->cpu;
     mmu_reset(&m->mmu);
@@ -912,6 +1039,7 @@ void machine_run(Machine *m){
     console_init();
 
     uint64_t idle = 0;
+    ParkWatch park; park_init(&park, PARK_LOOPS);
     for (;;) {
         if (m->stop) break;
         if (m->insn_limit && c->insns >= m->insn_limit) {
@@ -1072,7 +1200,121 @@ void machine_run(Machine *m){
                 break;
             }
         } else idle = 0;
+
+        /* ...and the same guest with a periodic interrupt still ticking.  The
+         * check above is defeated by ANY wakeup source: the tick clears
+         * vi_line, `idle' resets, and a guest parked in kboot's
+         * `hang: halt / jr hang' spins at 99% CPU forever.  park_step() is
+         * that hole closed -- see its comment for why this is a bound on NO
+         * PROGRESS and not a clock.  It is a channel of --stop-on like the
+         * others, because an IDLE guest wears the same signature as a dead
+         * one: a script that sleeps for longer than the budget is working,
+         * and a run ended there is a false report of a hang. */
+        if (m->park_watch && park_step(&park, m)) break;
     }
     dbg_finish(m);          /* --dump windows, once more, on whatever ended it */
     console_shutdown();
+}
+
+/* ── park_selftest (--selftest) ─────────────────────────────────────────────
+ *
+ * Both directions, because only one of them is the interesting one.  That a
+ * parked guest is now caught is easy to show and was shown against a real
+ * kboot; that a guest which is WORKING is never caught is the property the
+ * bound has to have to be allowed to exist at all, and it is the one a
+ * careless threshold quietly breaks.
+ *
+ * The watch is driven directly rather than through a boot: what is under test
+ * is the decision, and a test that has to boot something can only ever try the
+ * few shapes someone thought to build a disk for.  Each case drives park_step
+ * over a small budget many times, so "never fires" means never over a span
+ * many multiples of the budget -- which for the real PARK_LOOPS is hours. */
+static bool park_case(const char *name, uint64_t budget, uint64_t iters,
+                      void (*tick)(Machine *, uint64_t), bool want, int *ok){
+    Machine *m = machine_new();
+    CPU *c = &m->cpu;
+    ParkWatch p; park_init(&p, budget);
+    bool fired = false;
+    uint64_t at = 0;
+    for (uint64_t i = 0; i < iters && !fired; i++) {
+        /* One iteration of the run loop's shape: the guest is halted, except
+         * for a brief excursion every 64th iteration -- the tick's interrupt
+         * path, exactly the thing that used to reset the old check. */
+        bool waking = (i % 64) == 0;
+        c->halted = !waking;
+        if (waking) tick(m, i);
+        if (park_step(&p, m)) { fired = true; at = i; }
+    }
+    if (fired != want) {
+        printf("park FAIL: %s -- %s\n", name,
+               want ? "the watch never fired" : "the watch fired");
+        if (fired) printf("           it fired at iteration %llu of %llu\n",
+                          (unsigned long long)at, (unsigned long long)iters);
+        *ok = 0;
+    } else {
+        printf("park %s PASSED (%s)\n", name,
+               want ? "ended" : "ran to the end, never ended");
+    }
+    free(m->ram); free(m);
+    return fired;
+}
+
+/* (a) THE PARK.  kboot's `hang: halt / jr hang': the tick wakes it, it does
+ * nothing at all, it halts again at the same PC with the same registers.
+ * Nothing is printed, nothing is read, no scripted byte moves. */
+static void park_guest_parked(Machine *m, uint64_t i){ (void)m; (void)i; }
+
+/* (b) PROGRESS, the direction that protects a long legitimate run.  A guest
+ * that halts waiting for its next tick and does REAL WORK on each one -- a
+ * register moves.  It is halted for all but 1 iteration in 64, forever, and it
+ * must never be called parked, however long it runs. */
+static void park_guest_working(Machine *m, uint64_t i){ m->cpu.R[3] = (uint16_t)i; }
+
+/* (c) The same, where the only thing that changes is CONSOLE OUTPUT: a guest
+ * printing a progress dot every tick and otherwise idle.  The register file is
+ * identical every time, so this is the case that would be missed if the
+ * signature were registers alone. */
+static void park_guest_printing(Machine *m, uint64_t i){ m->last_tx_insn = i; }
+
+/* (d) A guest that is simply RUNNING -- never halted at all.  The cheapest
+ * thing to get wrong is a counter that advances when the CPU is up. */
+static void park_guest_running(Machine *m, uint64_t i){ (void)m; (void)i; }
+
+int park_selftest(void){
+    int ok = 1;
+    uint64_t budget = 100000;          /* the real run uses PARK_LOOPS */
+
+    /* Fires, and does not fire early: over one budget it must still be running. */
+    park_case("park caught", budget, budget * 4, park_guest_parked, true, &ok);
+    {
+        Machine *m = machine_new();
+        ParkWatch p; park_init(&p, budget);
+        m->cpu.halted = true;
+        bool early = false;
+        for (uint64_t i = 0; i < budget && !early; i++)
+            if (park_step(&p, m)) early = true;
+        if (early) { printf("park FAIL: fired inside its own budget\n"); ok = 0; }
+        else printf("park budget PASSED (silent for a whole budget)\n");
+        free(m->ram); free(m);
+    }
+
+    /* ...and never fires on a guest that is getting somewhere.  50 budgets:
+     * at the real PARK_LOOPS that is 25 billion iterations, hours of running. */
+    park_case("working guest spared", budget, budget * 50, park_guest_working,  false, &ok);
+    park_case("printing guest spared", budget, budget * 50, park_guest_printing, false, &ok);
+
+    {   /* (d) never halted */
+        Machine *m = machine_new();
+        ParkWatch p; park_init(&p, budget);
+        m->cpu.halted = false;
+        bool fired = false;
+        for (uint64_t i = 0; i < budget * 50 && !fired; i++) {
+            park_guest_running(m, i);
+            if (park_step(&p, m)) fired = true;
+        }
+        if (fired) { printf("park FAIL: fired on a guest that never halted\n"); ok = 0; }
+        else printf("park running-guest PASSED (never ended)\n");
+        free(m->ram); free(m);
+    }
+    return ok;
 }

@@ -84,6 +84,7 @@ static void on_sigint(int s){ (void)s; if (g_m) g_m->stop = true; }
  * Loads a tiny hand-assembled Z8001 program into RAM, single-steps it, and
  * checks register results. Verifies decode + ALU + branch + memory paths. */
 int lout_layout_selftest(void);   /* uexec.c */
+int park_selftest(void);          /* bus.c */
 
 /* ── The serial ports (run by --selftest) ───────────────────────────────────
  * Three properties, none of which any other test in the tree can see:
@@ -292,6 +293,10 @@ static int selftest(void){
     /* The serial ports: the SERIAL PORT TABLE, the wires and the overrun. */
     if (!serial_selftest()) ok = 0;
 
+    /* The park watch: a halted guest a periodic tick keeps waking is ended,
+     * and a guest that is getting somewhere never is. */
+    if (!park_selftest()) ok = 0;
+
     free(m->ram); free(m);
     return ok ? 0 : 1;
 }
@@ -343,8 +348,8 @@ static void usage(FILE *out, const char *prog){
         "                   decimal.  Read through the MMU exactly as the guest\n"
         "                   would, and leaving no trace in it.  Repeatable\n"
         "  --stop-on=LIST   which early-stop channels are armed, comma-separated:\n"
-        "                   \"idle\", \"port\" (the default), \"break\", \"all\" or\n"
-        "                   \"none\".\n"
+        "                   \"idle\", \"port\" and \"park\" (the default is\n"
+        "                   \"port,park\"), \"break\", \"all\" or \"none\".\n"
         "                   idle: for test harnesses, OFF unless asked for.  With\n"
         "                     --input, stop once every scripted byte has been fed\n"
         "                     and the guest is idle at a prompt: a prompt character\n"
@@ -355,6 +360,12 @@ static void usage(FILE *out, const char *prog){
         "                     from the guest, so it cannot fire on its own\n"
         "                   break: stop once a --break has recorded its last hit,\n"
         "                     with that instruction NOT yet executed\n"
+        "                   park: stop when the guest is halted, woken only by a\n"
+        "                     periodic interrupt, and doing nothing when woken.\n"
+        "                     An IDLE guest wears that signature too, so a script\n"
+        "                     that sleeps for longer than the watch's budget is\n"
+        "                     called parked while it is working: name your own\n"
+        "                     channels to leave it off\n"
         "  --idle=N         instructions of console silence the idle channel waits\n"
         "                   for, and arms it (default 40000000)\n"
         "  --stop-port=P    the port channel's I/O port (default 0x0FFE, which\n"
@@ -477,7 +488,7 @@ int main(int argc, char **argv){
     /* Idle is NOT armed by default: an emulator left alone must still be
      * running when its owner returns, however long the guest stays silent.
      * The port channel is, since only the guest itself can fire it. */
-    const char *g_stopon = "port";
+    const char *g_stopon = "port,park";
     bool idle_asked = false;             /* --idle=N given: tuning it asks for it */
     bool require_stop = false;
     for (int i=1;i<argc;i++){
@@ -564,22 +575,24 @@ int main(int argc, char **argv){
     /* --stop-on selects the channels; --idle and --stop-port only tune them.
      * Disarming a channel zeroes the field its run-loop test reads, so a
      * disarmed channel costs nothing and cannot fire. */
-    bool on_idle, on_port, on_break;
-    if (!strcmp(g_stopon,"none"))       on_idle = on_port = on_break = false;
-    else if (!strcmp(g_stopon,"all"))   on_idle = on_port = on_break = true;
+    bool on_idle, on_port, on_break, on_park;
+    if (!strcmp(g_stopon,"none"))       on_idle = on_port = on_break = on_park = false;
+    else if (!strcmp(g_stopon,"all"))   on_idle = on_port = on_break = on_park = true;
     else {
         on_idle = strstr(g_stopon,"idle") != NULL || idle_asked;
         on_port = strstr(g_stopon,"port") != NULL;
         on_break = strstr(g_stopon,"break") != NULL;
-        if (!on_idle && !on_port && !on_break) {
+        on_park = strstr(g_stopon,"park") != NULL;
+        if (!on_idle && !on_port && !on_break && !on_park) {
             fprintf(stderr,"--stop-on: expected a comma-separated list of "
-                           "idle, port and/or break, or all, or none\n");
+                           "idle, port, break and/or park, or all, or none\n");
             return 2;
         }
     }
     dbg_stop_at_break(on_break);
     m->idle_quiet = on_idle ? g_idle : 0;
     m->stop_port  = on_port ? (uint16_t)g_stopport : 0;
+    m->park_watch = on_park;
     m->inq_gateoff = -1;                 /* prompt gate applies throughout by default */
     /* An empty --input-mark is no mark: it would otherwise match instantly and
      * read as "wait for nothing" rather than as the mistake it is. */

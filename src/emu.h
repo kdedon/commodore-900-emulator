@@ -434,6 +434,14 @@ struct Machine {
     uint64_t idle_quiet;    /* instructions of console silence at a prompt, with the scripted
                              * input used up, that end the run (0 = never; --idle) */
     uint16_t stop_port;     /* I/O port whose 0xC900 write ends the run (0 = none; --stop-port) */
+    bool     park_watch;    /* --stop-on=park: end the run when the guest is parked -- halted,
+                             * woken only by a periodic interrupt, and doing nothing when
+                             * woken.  A guest that is merely IDLE looks exactly like that:
+                             * COHERENT's idle loop halts and the clock tick is the only thing
+                             * that wakes it, so a script that sleeps longer than the watch's
+                             * budget is called parked while it is working correctly.  The
+                             * channel is therefore selectable like every other, and a harness
+                             * whose guest sleeps names its own channels instead */
     const char *stop_why;   /* why the run ended, for the closing message and the exit status */
     bool     max_reached;   /* the run ended by exhausting --max rather than by stopping */
 
