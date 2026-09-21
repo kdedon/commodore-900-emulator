@@ -208,16 +208,19 @@ typedef struct { LoutGroup g[4]; uint8_t seg[4]; int base[4]; int ng, last_seg; 
 int lout_layout(const LoutHdr *h, LoutLayout *L, char *err, size_t errn);
 
 /* lout_check verifies the section sizes against the file: each is non-negative
- * and text+data+symbols lie inside it.  These are the extents every caller
- * slices the image with, and a size read out of a file that is not an l.out is
- * an arbitrary 32-bit number. */
+ * and every section with file bytes lies inside it, in l_ssize[] order minus
+ * bss: SHRI PRVI SHRD PRVD DEBUG SYM. */
+static long lout_symoff(const LoutHdr *h){
+    return (long)h->tbase + h->ss[0] + h->ss[1] + h->ss[3] + h->ss[4] + h->ss[6];
+}
 static void lout_check(size_t len, const char *path, LoutHdr *h){
     for (int i = 0; i < 9; i++)
         if (h->ss[i] < 0) lout_bad(path, "section %d size %d is negative", i, h->ss[i]);
-    long end = (long)h->tbase + h->ss[0] + h->ss[4] + h->ss[7];
+    long end = lout_symoff(h) + h->ss[7];
     if (end < 0 || end > (long)len)
-        lout_bad(path, "header describes %ld bytes (text %d + data %d + symbols %d at %d) "
-                       "but the file is %ld", end, h->ss[0], h->ss[4], h->ss[7], h->tbase, (long)len);
+        lout_bad(path, "header describes %ld bytes (shri %d + prvi %d + shrd %d + prvd %d + "
+                       "debug %d + symbols %d at %d) but the file is %ld", end, h->ss[0],
+                 h->ss[1], h->ss[3], h->ss[4], h->ss[6], h->ss[7], h->tbase, (long)len);
 }
 
 static LoutHdr lout_parse(const uint8_t *b, size_t len, const char *path){
@@ -329,21 +332,20 @@ static int urun(uint64_t budget, volatile bool *stop_flag){
 /* seg_image loads a LINKED l.out for the CALL-into-f modes.  Segment 0 holds
  * the reset PSA, the caller stub and the stack — cc2 frame access is seg-0
  * short-form X-mode, so stack locals live in segment 0, matching the real C900
- * (CODE seg 3 / STACK seg 0).  The CODE segment (read from entry symbol `name's
- * linked address; 0 for a flat link) holds text followed by the PRVD data and
- * literal pool: n2 places globals AND the far-pointer literal pool (the
- * {seg,offset} constants a `gp=&global' loads) in PRVD, not BSS, so skipping the
- * data load leaves those zero and a far pointer reads {0,0}.  A flat link loads
- * text at 0x200 (ld -R 0x200); a segmented link bases its code segment at 0. */
+ * (CODE seg 3 / STACK seg 0).  Text goes in the segment of symbol `name', at
+ * 0x200 for a flat link, else at 0.  Sections are grouped by link flags:
+ *
+ *     ld        [si][pi][sd][pd]
+ *     ld -n     [si][sd] | [pi][pd]
+ *     ld -i     [si][pi] | [sd][pd]
+ *     ld -n -i  one segment per non-empty section */
 static void seg_image(const uint8_t *b, size_t len, const char *path, const char *name,
                       uint8_t *code_seg, uint16_t *entry){
     LoutHdr h = lout_parse(b, len, path);
-    int text_size = h.ss[0], data_size = h.ss[4], sym_size = h.ss[7];
-    const uint8_t *text = b + h.tbase;
-    const uint8_t *data = b + h.tbase + text_size;
+    int sym_size = h.ss[7];
 
     uint8_t cseg = 0; uint16_t ent = 0; bool have = false;
-    int symbase = h.tbase + text_size + data_size;
+    int symbase = (int)lout_symoff(&h);
     size_t nlen = strlen(name);
     for (int o = symbase; o + h.symrec <= symbase + sym_size; o += h.symrec) {
         char nm[17];
@@ -359,15 +361,20 @@ static void seg_image(const uint8_t *b, size_t len, const char *path, const char
     if (cseg != 0) textoff = 0;
     if (!have) ent = (uint16_t)textoff;
 
-    /* Text and the PRVD pool go into ONE segment here, so an object whose two
-     * sections do not fit a 64K page cannot be run in this mode at all. */
-    if (textoff + text_size + data_size > 0x10000)
-        lout_bad(path, "text %d + data %d at offset %#x does not fit the single code segment "
-                       "this mode loads into", text_size, data_size, textoff);
+    LoutHdr lh = h;
+    lh.entry_seg = cseg; lh.entry_off = (uint16_t)textoff;
+    LoutLayout L; char err[256];
+    if (lout_layout(&lh, &L, err, sizeof err) < 0) lout_bad(path, "%s", err);
 
-    umach_new(cseg > 0 ? cseg : 0);
-    for (int i = 0; i < text_size; i++) gw8(cseg, textoff + i, text[i]);
-    for (int i = 0; i < data_size; i++) gw8(cseg, textoff + text_size + i, data[i]);
+    umach_new(L.last_seg);
+    for (int k = 0; k < L.ng; k++)
+        for (int p = 0; p < L.g[k].np; p++) {
+            const LoutPiece *pc = &L.g[k].p[p];
+            for (int i = 0; i < pc->len; i++) {
+                int at = L.base[k] + pc->moff + i;   /* rolls into the next segment past 64K */
+                gw8((uint8_t)(L.seg[k] + at / 0x10000), (uint16_t)(at % 0x10000), b[pc->foff + i]);
+            }
+        }
     gw16(0, 0x0002, 0xC000);   /* reset FCW: SEG | system mode */
     gw16(0, 0x0004, 0x0000);   /* reset PC segment (the stub lives in segment 0) */
     *code_seg = cseg; *entry = ent;
@@ -991,6 +998,35 @@ int lout_layout_selftest(void){
          * that checking every group covered it. */
         if (ok && L.seg[ng-1] != t[i].want_seg[t[i].want_ng-1]) {
             printf("lout_layout FAIL: %s: data segment %d\n", t[i].name, L.seg[ng-1]);
+            ok = 0;
+        }
+    }
+    /* Flat image with SHRD: in each link mode SHRD and PRVD land where ld
+     * put them. */
+    struct { int flag; int sd_seg, sd_off, pd_seg, pd_off; } r[] = {
+        { 000, 0, 0x204, 0, 0x208 },   /* ld:       [si][sd][pd]          */
+        { 001, 0, 0x204, 1, 0 },       /* ld -n:    [si][sd] | [pd]       */
+        { 002, 1, 0,     1, 4 },       /* ld -i:    [si]     | [sd][pd]   */
+        { 003, 1, 0,     2, 0 },       /* ld -n -i: [si] | [sd] | [pd]    */
+    };
+    for (size_t i = 0; i < sizeof r / sizeof r[0]; i++) {
+        uint8_t img[128]; memset(img, 0, sizeof img);   /* past the 88-byte minimum */
+        int ss[9] = { 4, 0, 0, 4, 2, 0, 0, 22, 0 };
+        img[0] = LOUT_MAGIC & 0xFF; img[1] = LOUT_MAGIC >> 8;
+        img[2] = (uint8_t)r[i].flag; img[6] = 48;
+        for (int k = 0; k < 9; k++) img[8+4*k+2] = (uint8_t)ss[k];   /* lo word, LE */
+        memcpy(img + 48, "\x7A\x00\x7A\x00", 4);   /* text */
+        memcpy(img + 52, "SHRD", 4);
+        memcpy(img + 56, "PD", 2);
+        uint8_t *sym = img + 58;
+        sym[0] = 'f'; sym[19] = 0; sym[20] = 0x00; sym[21] = 0x02;   /* 00:0200 */
+        uint8_t cs; uint16_t ent;
+        seg_image(img, sizeof img, "selftest", "f", &cs, &ent);
+        if (cs != 0 || ent != 0x200 || gr8(r[i].sd_seg, r[i].sd_off) != 'S'
+            || gr8(r[i].sd_seg, r[i].sd_off + 3) != 'D' || gr8(r[i].pd_seg, r[i].pd_off) != 'P'
+            || gr8(r[i].pd_seg, r[i].pd_off + 1) != 'D') {
+            printf("seg_image FAIL: flag %o: SHRD not at %02X:%04X or PRVD not at %02X:%04X\n",
+                   r[i].flag, r[i].sd_seg, r[i].sd_off, r[i].pd_seg, r[i].pd_off);
             ok = 0;
         }
     }
