@@ -86,6 +86,7 @@ static void on_sigint(int s){ (void)s; if (g_m) g_m->stop = true; }
 int lout_layout_selftest(void);   /* uexec.c */
 int park_selftest(void);          /* bus.c */
 int stop_mark_selftest(void);     /* bus.c */
+int keypace_selftest(void);       /* bus.c */
 
 /* ── The serial ports (run by --selftest) ───────────────────────────────────
  * Three properties, none of which any other test in the tree can see:
@@ -300,6 +301,7 @@ static int selftest(void){
 
     /* The stop mark: ends on the text the guest prints, and on nothing else. */
     if (!stop_mark_selftest()) ok = 0;
+    if (!keypace_selftest()) ok = 0;
 
     free(m->ram); free(m);
     return ok ? 0 : 1;
@@ -334,6 +336,27 @@ static void usage(FILE *out, const char *prog){
         "                   guest is rebuilt, unlike an instruction count.  The\n"
         "                   mark is a starting gun -- once seen it stays open,\n"
         "                   and paced bytes are not affected by it at all\n"
+        "  --key-pace=N     one key at a time: hold each scripted byte until the\n"
+        "                   guest has ANSWERED the byte before it on the console\n"
+        "                   and the console has then been quiet for N\n"
+        "                   instructions.  Off at 0 (the default), which is the\n"
+        "                   pacing above: a byte on silence alone.  Silence cannot\n"
+        "                   tell a program that is thinking from one that is\n"
+        "                   waiting, so a full-screen program that takes a second\n"
+        "                   of emulated time per command collects the whole script\n"
+        "                   into its type-ahead and throws it away.  Its own output\n"
+        "                   says it acted, and waiting for that costs exactly as\n"
+        "                   long as the program takes -- a key needing a billion\n"
+        "                   instructions and a key needing a thousand both go in as\n"
+        "                   soon as they can, which no fixed count does.  The first\n"
+        "                   byte has nothing to answer and \\i bytes have asked not\n"
+        "                   to wait; neither is held\n"
+        "  --key-react=N    console bytes that count as an answer (default 1), for\n"
+        "                   a guest that echoes the key itself before acting on it\n"
+        "  --key-deadline=N instructions an unanswered key waits before the next\n"
+        "                   byte goes in on the quiet window alone (default 0:\n"
+        "                   wait forever, so a lost reaction stalls the script\n"
+        "                   rather than silently going back to losing keys)\n"
         "  --break=SEG:OFF[/N]  record CPU state at a guest PC, before the\n"
         "                   instruction there executes: PC, instruction count, FCW,\n"
         "                   mode and all sixteen registers, as one \"[dbg] brk\"\n"
@@ -500,6 +523,8 @@ int main(int argc, char **argv){
     unsigned long long g_max = 0;
     /* the same silence the scripted-input pacing uses for its longest wait */
     unsigned long long g_idle = 40000000ull;
+    unsigned long long g_keypace = 0, g_keydead = 0;   /* --key-pace, off unless asked for */
+    unsigned long g_keyreact = 1;
     unsigned long g_stopport = 0x0FFE;   /* see bus.c io_write: unclaimed I/O space */
     /* Idle is NOT armed by default: an emulator left alone must still be
      * running when its owner returns, however long the guest stays silent.
@@ -518,6 +543,9 @@ int main(int argc, char **argv){
         else if ((v = opt_value(argv,argc,&i,"--max")))      g_max = strtoull(v,0,0);
         else if ((v = opt_value(argv,argc,&i,"--input-mark"))) g_inmark = v;
         else if ((v = opt_value(argv,argc,&i,"--input")))    g_input = v;
+        else if ((v = opt_value(argv,argc,&i,"--key-pace")))  g_keypace = strtoull(v,0,0);
+        else if ((v = opt_value(argv,argc,&i,"--key-react"))) g_keyreact = strtoul(v,0,0);
+        else if ((v = opt_value(argv,argc,&i,"--key-deadline"))) g_keydead = strtoull(v,0,0);
         else if ((v = opt_value(argv,argc,&i,"--idle")))   { g_idle = strtoull(v,0,0); idle_asked = true; }
         else if ((v = opt_value(argv,argc,&i,"--stop-port"))) g_stopport = strtoul(v,0,0);
         else if ((v = opt_value(argv,argc,&i,"--stop-on")))  g_stopon = v;
@@ -624,6 +652,9 @@ int main(int argc, char **argv){
     m->stop_port  = on_port ? (uint16_t)g_stopport : 0;
     m->stop_mark  = (on_mark && mark_asked) ? g_stopmark : NULL;
     m->park_watch = on_park;
+    m->key_quiet    = g_keypace;
+    m->key_react    = g_keyreact ? (uint32_t)g_keyreact : 1;
+    m->key_deadline = g_keydead;
     m->inq_gateoff = -1;                 /* prompt gate applies throughout by default */
     /* An empty --input-mark is no mark: it would otherwise match instantly and
      * read as "wait for nothing" rather than as the mistake it is. */

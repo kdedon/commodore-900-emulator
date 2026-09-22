@@ -423,6 +423,21 @@ struct Machine {
     int      inq_mark_pos;  /* how much of inq_mark has matched the console output so far */
     bool     inq_mark_seen; /* the whole of it has been printed: type-ahead is now open, and
                              * stays open -- the mark is a starting gun, not a gate */
+    /* ── per-key pacing (--key-pace, off at 0) ──
+     * Releases a scripted byte only once the guest has ANSWERED the previous
+     * one on the console and then fallen quiet.  The ready signal is the
+     * guest's own reaction rather than a fixed wait, so a program needing a
+     * billion instructions per keystroke and one needing a thousand are both
+     * fed as fast as they can take it.  Without it a byte goes in on silence
+     * alone, and a program that is merely thinking looks exactly like one that
+     * is waiting -- so the key lands in a type-ahead buffer the program later
+     * throws away. */
+    uint64_t key_quiet;     /* console silence, after the reaction, that releases the next byte */
+    uint32_t key_react;     /* console bytes that count as a reaction (--key-react) */
+    uint64_t key_deadline;  /* instructions after which an unanswered key stops waiting
+                             * for its reaction (--key-deadline; 0 = wait forever) */
+    uint32_t key_out;       /* console bytes the guest has printed since the last byte fed */
+    uint64_t key_fed;       /* insn count when that byte was fed */
     uint32_t rx_poll_streak;/* consecutive console RR0 polls (rx empty) since the last console TX;
                              * at RX_BLOCKED_POLLS the guest is reading, not running */
     bool     guest_polls;   /* a blocked-reading RR0 poll streak has been observed since the last

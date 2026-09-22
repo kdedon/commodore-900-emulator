@@ -264,6 +264,7 @@ static void scc_write(Machine *m, int chip, int chan, int addrReg, uint8_t v){
             console_put_char(v);
             m->last_tx_insn = m->cpu.insns;
             m->rx_poll_streak = 0;
+            m->key_out++;              /* the guest answering the last scripted byte */
             /* --input-mark: watch the guest's own output for the text that
              * releases the scripted type-ahead bytes.  Matching on what is
              * PRINTED is the one synchronisation a test can state exactly --
@@ -1083,6 +1084,89 @@ static bool park_step(ParkWatch *p, Machine *m){
     return false;
 }
 
+/* Hands the next scripted byte to the console receiver if the guest looks
+ * ready for it, and says whether it did.  The receiver must already be empty. */
+static bool feed_scripted(Machine *m){
+    CPU *c = &m->cpu;
+    /* Coherent reads the console by Rx interrupt and does not poll RR0
+     * while idle, so a byte goes in once the prompt is up and the
+     * console has been briefly TX-quiet.  After a CR we wait for a
+     * fresh '#' (prompt_seq to advance) before the next command's first
+     * byte, so a still-running command cannot swallow it. */
+    /* Past inq_gateoff the prompt requirement drops; the quiet-console
+     * one still applies.  A curses program prints no `#', so without
+     * this the CR ending its first input is the last byte it can ever
+     * receive.  A position rather than a flag: the shell commands that
+     * set the game up still need the gate. */
+    bool past_gate = (m->inq_gateoff >= 0 &&
+                      m->inq_pos >= m->inq_gateoff);
+    /* The first byte past the gate waits much longer: a curses program
+     * is noisy while it draws and only then goes quiet to read, and
+     * that quiet is the only ready signal available. */
+    uint64_t quiet = (past_gate && m->inq_pos == m->inq_gateoff)
+                     ? 40000000ull : 300000ull;
+    /* Past the gate a command's own output pauses look like silence,
+     * and a byte fed into one is eaten by its output path (CP/M's BDOS
+     * checks for ^S/^C there).  So wait until the guest is provably
+     * reading: an RR0 poll streak, or the long silence for a guest that
+     * never polls.  Per-byte, not sticky -- the boot ROM polls at its
+     * menu, and a sticky flag would then pace an interrupt-driven guest
+     * booted through it at 40M per keystroke. */
+    if (past_gate && (m->inq_cr_wait || m->guest_polls) &&
+        m->rx_poll_streak < RX_BLOCKED_POLLS)
+        quiet = 40000000ull;
+    /* TYPE-AHEAD (the \i escape marks the byte): deliver it the
+     * moment the receiver is free, with no gate, no prompt and no
+     * quiet wait.  Everything above answers the question "is the
+     * guest ready for this byte yet?", and answers it conservatively
+     * because a byte handed over too early is eaten by whatever read
+     * the guest happens to be in -- a boot-ROM probe, or a running
+     * program's own output path, where CP/M's BDOS polls for ^S/^Q/^C
+     * between characters.  \i is the caller saying it WANTS that
+     * reader: the ^S of a flow-control test is aimed at exactly the
+     * output-path poll the pacing exists to dodge, and no amount of
+     * waiting produces it, because a guest that is printing never
+     * looks blocked and never falls silent.  So the choice is left
+     * where it belongs, with whoever wrote the script, one byte at a
+     * time: the gated pacing is unchanged for every byte not marked,
+     * and a marked byte still waits for the receiver to be empty, so
+     * the queue can never overrun the guest or reorder itself. */
+    bool now = m->inq_pos < m->inq_len && m->inq_now[m->inq_pos] &&
+               (!m->inq_mark || m->inq_mark_seen);
+    /* --key-pace: one key at a time, each released only once the guest has
+     * answered the one before it and then gone quiet.  The silence rules
+     * above cannot tell a program that is thinking from one that is waiting,
+     * so a full-screen editor collects the whole script into its type-ahead
+     * and drops it; an answer on the console is proof it acted.  The first
+     * byte has nothing to answer, and a type-ahead byte has asked not to
+     * wait, so neither is held. */
+    bool answered = true;
+    if (m->key_quiet && m->inq_pos > 0 && !now) {
+        quiet = m->key_quiet;
+        answered = m->key_out >= m->key_react ||
+                   (m->key_deadline && c->insns - m->key_fed > m->key_deadline);
+    }
+    if (m->inq_pos < m->inq_len &&
+        (now || (answered && m->shell_up &&
+                 (past_gate || m->prompt_seq >= m->inq_wait_seq) &&
+                 (c->insns - m->last_tx_insn) > quiet))) {
+        uint8_t b = m->inq[m->inq_pos++];
+        scc_rx_console(m, b);
+        if (getenv("C900_FEED_DEBUG"))
+            fprintf(stderr, "[feed %02x '%c' insns=%llu streak=%u polls=%d quiet=%s]\n",
+                    b, (b>=32&&b<127)?b:'.', (unsigned long long)c->insns,
+                    m->rx_poll_streak, m->guest_polls,
+                    now ? "type-ahead" : "waited");
+        m->guest_polls = false;
+        m->key_out = 0;
+        m->key_fed = c->insns;
+        m->inq_cr_wait = (b == '\r' || b == '\n');
+        if (m->inq_cr_wait) m->inq_wait_seq = m->prompt_seq + 1;
+        return true;
+    }
+    return false;
+}
+
 void machine_run(Machine *m){
     CPU *c = &m->cpu;
     mmu_reset(&m->mmu);
@@ -1117,66 +1201,7 @@ void machine_run(Machine *m){
         /* Poll host console only every 4096 instructions — _kbhit()/read()
          * is a syscall and doing it per-instruction dominates runtime. */
         if (!m->scc_b.rx_avail) {
-            /* Coherent reads the console by Rx interrupt and does not poll RR0
-             * while idle, so a byte goes in once the prompt is up and the
-             * console has been briefly TX-quiet.  After a CR we wait for a
-             * fresh '#' (prompt_seq to advance) before the next command's first
-             * byte, so a still-running command cannot swallow it. */
-            /* Past inq_gateoff the prompt requirement drops; the quiet-console
-             * one still applies.  A curses program prints no `#', so without
-             * this the CR ending its first input is the last byte it can ever
-             * receive.  A position rather than a flag: the shell commands that
-             * set the game up still need the gate. */
-            bool past_gate = (m->inq_gateoff >= 0 &&
-                              m->inq_pos >= m->inq_gateoff);
-            /* The first byte past the gate waits much longer: a curses program
-             * is noisy while it draws and only then goes quiet to read, and
-             * that quiet is the only ready signal available. */
-            uint64_t quiet = (past_gate && m->inq_pos == m->inq_gateoff)
-                             ? 40000000ull : 300000ull;
-            /* Past the gate a command's own output pauses look like silence,
-             * and a byte fed into one is eaten by its output path (CP/M's BDOS
-             * checks for ^S/^C there).  So wait until the guest is provably
-             * reading: an RR0 poll streak, or the long silence for a guest that
-             * never polls.  Per-byte, not sticky -- the boot ROM polls at its
-             * menu, and a sticky flag would then pace an interrupt-driven guest
-             * booted through it at 40M per keystroke. */
-            if (past_gate && (m->inq_cr_wait || m->guest_polls) &&
-                m->rx_poll_streak < RX_BLOCKED_POLLS)
-                quiet = 40000000ull;
-            /* TYPE-AHEAD (the \i escape marks the byte): deliver it the
-             * moment the receiver is free, with no gate, no prompt and no
-             * quiet wait.  Everything above answers the question "is the
-             * guest ready for this byte yet?", and answers it conservatively
-             * because a byte handed over too early is eaten by whatever read
-             * the guest happens to be in -- a boot-ROM probe, or a running
-             * program's own output path, where CP/M's BDOS polls for ^S/^Q/^C
-             * between characters.  \i is the caller saying it WANTS that
-             * reader: the ^S of a flow-control test is aimed at exactly the
-             * output-path poll the pacing exists to dodge, and no amount of
-             * waiting produces it, because a guest that is printing never
-             * looks blocked and never falls silent.  So the choice is left
-             * where it belongs, with whoever wrote the script, one byte at a
-             * time: the gated pacing is unchanged for every byte not marked,
-             * and a marked byte still waits for the receiver to be empty, so
-             * the queue can never overrun the guest or reorder itself. */
-            bool now = m->inq_pos < m->inq_len && m->inq_now[m->inq_pos] &&
-                       (!m->inq_mark || m->inq_mark_seen);
-            if (m->inq_pos < m->inq_len &&
-                (now || (m->shell_up &&
-                         (past_gate || m->prompt_seq >= m->inq_wait_seq) &&
-                         (c->insns - m->last_tx_insn) > quiet))) {
-                uint8_t b = m->inq[m->inq_pos++];
-                scc_rx_console(m, b);
-                if (getenv("C900_FEED_DEBUG"))
-                    fprintf(stderr, "[feed %02x '%c' insns=%llu streak=%u polls=%d quiet=%s]\n",
-                            b, (b>=32&&b<127)?b:'.', (unsigned long long)c->insns,
-                            m->rx_poll_streak, m->guest_polls,
-                            now ? "type-ahead" : "waited");
-                m->guest_polls = false;
-                m->inq_cr_wait = (b == '\r' || b == '\n');
-                if (m->inq_cr_wait) m->inq_wait_seq = m->prompt_seq + 1;
-            } else if ((m->tick_counter & 0x0FFF) == 0) {
+            if (!feed_scripted(m) && (m->tick_counter & 0x0FFF) == 0) {
                 int ch = console_poll_char();
                 if (ch == 0x1D) { m->stop = true; m->stop_why = "Ctrl-] at the console"; }
                                                                /* Ctrl-] quits the emulator;
@@ -1393,6 +1418,68 @@ static void mark_case_crosstalk(const char *mark, const char *feed,
     } else
         printf("\nstop mark crosstalk PASSED (channels never combined)\n");
     free(m->ram); free(m);
+}
+
+/* A guest in the shape of the one --key-pace exists for: it takes a key, works
+ * on it in silence for a long burst while draining and DISCARDING anything
+ * that arrives meanwhile (its own type-ahead), prints one character when it is
+ * done, and only then reads again.  Returns how many of the scripted keys it
+ * actually acted on.
+ *
+ *      key in ──> [ burst: reads and drops keys, prints nothing ] ──> 'K' ──> read
+ *                        ^ silence here is not readiness
+ */
+static void keypace_run(uint64_t quiet, uint64_t deadline, int keys, bool answers,
+                        int *acted, int *fed){
+    const uint64_t STEP = 10000, BURST = 100000000ull;   /* burst >> the 40M silence rule */
+    Machine *m = machine_new();
+    m->shell_up = true;
+    m->inq_gateoff = 0;
+    m->key_quiet = quiet; m->key_react = 1; m->key_deadline = deadline;
+    for (int i = 0; i < keys; i++) m->inq[m->inq_len++] = (uint8_t)('A' + i);
+
+    *acted = 0;
+    uint64_t busy_until = 0;
+    for (uint64_t step = 0; step < 200000; step++) {
+        m->cpu.insns += STEP;
+        bool busy = m->cpu.insns < busy_until;
+        if (scc_read(m, 0, 0, 0) & 0x01) {               /* RR0: anything waiting? */
+            scc_read(m, 0, 0, 8);
+            if (!busy) { (*acted)++; busy_until = m->cpu.insns + BURST; }
+        } else if (busy_until && !busy) {
+            if (answers) scc_write(m, 0, 0, 8, 'K');     /* one character of proof */
+            busy_until = 0;
+        }
+        if (!m->scc_b.rx_avail) feed_scripted(m);
+    }
+    *fed = m->inq_pos;
+    free(m->ram); free(m);
+}
+
+int keypace_selftest(void){
+    int ok = 1;
+    const int keys = 4;
+    struct { const char *what; uint64_t quiet, deadline; bool answers, count_acted; int want; } c[] = {
+        /* Unpaced, the keys go in on silence alone and the burst eats all but
+         * the first. */
+        { "pacing off loses keys",       0,       0, true,  true,  1    },
+        { "paced keys all arrive", 2000000,       0, true,  true,  keys },
+        /* A guest that never answers: the script waits rather than feeding a
+         * burst that will drop the bytes, and a deadline starts it again. */
+        { "no answer, script waits", 2000000,       0, false, false, 1    },
+        { "deadline releases",       2000000, 40000000ull, false, false, keys },
+    };
+    for (size_t i = 0; i < sizeof c / sizeof *c; i++) {
+        int acted, fed;
+        keypace_run(c[i].quiet, c[i].deadline, keys, c[i].answers, &acted, &fed);
+        int got = c[i].count_acted ? acted : fed;
+        if (got != c[i].want) {
+            printf("\nkey-pace FAIL: %s: %d of %d keys %s, expected %d\n",
+                   c[i].what, got, keys, c[i].count_acted ? "acted on" : "fed", c[i].want);
+            ok = 0;
+        } else printf("\nkey-pace %s PASSED (%d of %d)\n", c[i].what, got, keys);
+    }
+    return ok;
 }
 
 int stop_mark_selftest(void){
