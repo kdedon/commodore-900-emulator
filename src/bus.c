@@ -155,6 +155,19 @@ static uint8_t scc_rr3_of(Machine *m, int chip){
  * register pointer (ch->ptr, set via a WR0 write) is non-zero, in which case it
  * overrides for this one access and then auto-resets.  chan=1 → Channel A
  * (AD5 high, scc_a), chan=0 → Channel B (the console, scc_b). */
+/* How far into a line a prompt character may be and still end a prompt: room
+ * for "boot> " and "A>", and none for a sentence. */
+#define PROMPT_MAX_COL 8
+
+/* A prompt is confirmed: scripted input may be fed, and one more prompt has
+ * been printed. */
+static void prompt_latch(Machine *m){
+    m->prompt_pend = false;
+    m->shell_up = true;
+    m->prompt_seq++;
+    m->at_prompt = true;         /* the console fell silent AT a prompt (see --idle) */
+}
+
 static uint8_t scc_read(Machine *m, int chip, int chan, int addrReg){
     SCCChan *ch = scc_chan_of(m, chip, chan);
     if (!ch) return 0;
@@ -174,6 +187,10 @@ static uint8_t scc_read(Machine *m, int chip, int chan, int addrReg){
         if (console && !ch->rx_avail) {
             m->rx_poll_streak++;
             if (m->rx_poll_streak >= RX_BLOCKED_POLLS) m->guest_polls = true;
+            /* A prompt character and then a blocked read is a prompt as well:
+             * CP/M's "A>" has no trailing space. */
+            if (m->prompt_pend && m->rx_poll_streak >= RX_BLOCKED_POLLS)
+                prompt_latch(m);
         }
         return v;
     }
@@ -264,6 +281,7 @@ static void scc_write(Machine *m, int chip, int chan, int addrReg, uint8_t v){
             console_put_char(v);
             m->last_tx_insn = m->cpu.insns;
             m->rx_poll_streak = 0;
+            m->key_out++;              /* the guest answering the last scripted byte */
             /* --input-mark: watch the guest's own output for the text that
              * releases the scripted type-ahead bytes.  Matching on what is
              * PRINTED is the one synchronisation a test can state exactly --
@@ -288,16 +306,36 @@ static void scc_write(Machine *m, int chip, int chan, int addrReg, uint8_t v){
             stop_mark_watch(m, port, v);
             /* Prompt characters gate scripted input: the Coherent shell
              * prompts with '#', the kboot menu with "boot> ", and CP/M's CCP
-             * with "A>" -- so '#' or '>' latches input-ready and counts a
-             * prompt, letting scripts pace one line per prompt across all
-             * three.  Latch only once the power-on tests are well behind us so
-             * input is fed to a real prompt, not some earlier boot-time read;
-             * the diagnostics print neither character and the first prompt
+             * with "A>", and scripts pace one line per prompt across all
+             * three.  The character alone is not a prompt: a '>' anywhere in a
+             * program's own output used to release the next command into the
+             * middle of a line, and printing "->" was enough to corrupt a run.
+             * So it counts only where a prompt can be -- at the head of a
+             * line, alone or ending a word like "boot" or "A" -- and only once
+             * the guest confirms it is waiting for input, by printing the
+             * space after it or by blocking on a console read.  Latch only
+             * once the power-on tests are well behind us so input is fed to a
+             * real prompt, not some earlier boot-time read; the first prompt
              * appears past 2-3M instructions, so 1M clears the diagnostics. */
-            if ((v == '#' || v == '>') && m->cpu.insns > 1000000) {
-                m->shell_up = true; m->prompt_seq++;
-                m->at_prompt = true;     /* the console fell silent AT a prompt (see --idle) */
-            } else m->at_prompt = false;
+            /* Controls a terminal ignores (NUL padding, BEL, DEL) move no
+             * cursor, so they leave the gate as it was. */
+            bool ignored = (v < 0x20 && v != '\b' && v != '\t' &&
+                            v != '\n' && v != '\r') || v == 0x7F;
+            if (ignored) ;
+            else if (m->prompt_pend && v == ' ') prompt_latch(m);
+            else if ((v == '#' || v == '>') && m->cpu.insns > 1000000 &&
+                     m->tx_col <= PROMPT_MAX_COL &&
+                     (m->tx_col == 0 || m->tx_alnum))
+                m->prompt_pend = true;   /* a space or a blocked read confirms it */
+            else { m->prompt_pend = false; m->at_prompt = false; }
+            if (ignored) ;
+            else if (v == '\b') { if (m->tx_col > 0) m->tx_col--; }
+            else if (v == '\n' || v == '\r') { m->tx_col = 0; m->tx_alnum = true; }
+            else {
+                m->tx_col++;
+                if (!((v>='0'&&v<='9')||(v>='A'&&v<='Z')||(v>='a'&&v<='z')))
+                    m->tx_alnum = false;
+            }
         }
         return;
     }
@@ -900,6 +938,7 @@ Machine *machine_new(void){
     m->ram = calloc(PHYS_SIZE + 2, 1);
     m->cpu.m = m;
     m->hdc_cmdblk = 0x080000;
+    m->tx_alnum = true;      /* nothing printed on this line yet */
     m->cio1_reset = true;
     m->cio2_reset = true;
     /* The module is fitted on a real board, so it is fitted by default.  One
@@ -1000,12 +1039,20 @@ int machine_attach_floppy(Machine *m, const char *path){
  * path the guest cannot observe.  A run retires exactly the instructions it
  * retired before. */
 
-/* Iterations of an unbroken, identical park before the run is called over.
- * The sibling check uses 2,000,000 for a CPU with no wakeup at all, which is
- * unambiguous the moment it is seen.  This wants more room, so it is 250x
- * that: about twenty seconds of parked spinning on a current host, and
- * unreachable for a guest whose registers or console traffic ever change. */
-#define PARK_LOOPS 500000000ull
+/* GUEST time of an unbroken, identical park before the run is called over,
+ * counted in system ticks -- 100 of them a guest second.  Host iterations are
+ * the wrong unit: a guest asleep in `sleep 600' wears a parked signature, and a
+ * budget in host loops ended it after a few hundred guest seconds and called
+ * working code hung.  Half an hour of guest time leaves a ten-minute sleep
+ * three times the room it needs, and is unreachable for a guest whose
+ * registers or console traffic ever change.  A halted guest's loop spends it
+ * in well under a minute of host time -- the guest clock runs about 50x real
+ * time while the CPU is halted. */
+#define PARK_TICKS 180000ull
+/* While scripted input is still waiting to go in, the guest is at a rendezvous
+ * rather than idling, so it gets this multiple of the budget.  A multiple and
+ * not forever: a gate that never opens has to end the run too. */
+#define PARK_INPUT_SLACK 4ull
 /* Consecutive non-halted iterations that count as the guest having WOKEN UP
  * AND DONE SOMETHING, which throws the signature away rather than merely
  * resetting the count.  A tick interrupt path is tens of instructions; this is
@@ -1014,8 +1061,8 @@ int machine_attach_floppy(Machine *m, const char *path){
 #define PARK_AWAKE 100000ull
 
 typedef struct {
-    uint64_t budget;        /* PARK_LOOPS for a real run; the selftest uses a small one */
-    uint64_t loops;         /* iterations parked in an unbroken identical halt */
+    uint64_t budget;        /* PARK_TICKS for a real run; the selftest uses a small one */
+    uint64_t tick0;         /* m->ct3_ticks when the current signature was taken */
     uint64_t awake;         /* consecutive iterations not halted */
     bool     was_halted;    /* to catch the moment it halts, which is when we look */
     bool     valid;         /* a signature has been taken */
@@ -1063,11 +1110,11 @@ static bool park_step(ParkWatch *p, Machine *m){
                  && m->inq_pos      == p->inq
                  && m->prompt_seq   == p->seq;
         if (!same) {                            /* something moved: start over */
-            p->loops = 0;
             p->valid = true;
             memcpy(p->R, c->R, sizeof p->R);
             p->pc = c->pc; p->fcw = c->fcw;
             p->tx = m->last_tx_insn; p->inq = m->inq_pos; p->seq = m->prompt_seq;
+            p->tick0 = m->ct3_ticks;
             if (getenv("C900_PARK_DEBUG"))
                 fprintf(stderr, "[park reset at pc=%06X insns=%llu]\n",
                         c->pc, (unsigned long long)c->insns);
@@ -1075,9 +1122,96 @@ static bool park_step(ParkWatch *p, Machine *m){
     }
     p->was_halted = true;
 
-    if (p->valid && ++p->loops > p->budget) {
+    /* Guest time, not host loops: a guest sleeping through its own clock is
+     * doing what it was told to. */
+    uint64_t budget = p->budget;
+    if (m->inq_pos < m->inq_len) budget *= PARK_INPUT_SLACK;
+    if (p->valid && m->ct3_ticks - p->tick0 > budget) {
         m->stop_why = "the guest is parked: halted, woken only by a periodic "
                       "interrupt, and doing nothing when woken";
+        return true;
+    }
+    return false;
+}
+
+/* Hands the next scripted byte to the console receiver if the guest looks
+ * ready for it, and says whether it did.  The receiver must already be empty. */
+static bool feed_scripted(Machine *m){
+    CPU *c = &m->cpu;
+    /* Coherent reads the console by Rx interrupt and does not poll RR0
+     * while idle, so a byte goes in once the prompt is up and the
+     * console has been briefly TX-quiet.  After a CR we wait for a
+     * fresh '#' (prompt_seq to advance) before the next command's first
+     * byte, so a still-running command cannot swallow it. */
+    /* Past inq_gateoff the prompt requirement drops; the quiet-console
+     * one still applies.  A curses program prints no `#', so without
+     * this the CR ending its first input is the last byte it can ever
+     * receive.  A position rather than a flag: the shell commands that
+     * set the game up still need the gate. */
+    bool past_gate = (m->inq_gateoff >= 0 &&
+                      m->inq_pos >= m->inq_gateoff);
+    /* The first byte past the gate waits much longer: a curses program
+     * is noisy while it draws and only then goes quiet to read, and
+     * that quiet is the only ready signal available. */
+    uint64_t quiet = (past_gate && m->inq_pos == m->inq_gateoff)
+                     ? 40000000ull : 300000ull;
+    /* Past the gate a command's own output pauses look like silence,
+     * and a byte fed into one is eaten by its output path (CP/M's BDOS
+     * checks for ^S/^C there).  So wait until the guest is provably
+     * reading: an RR0 poll streak, or the long silence for a guest that
+     * never polls.  Per-byte, not sticky -- the boot ROM polls at its
+     * menu, and a sticky flag would then pace an interrupt-driven guest
+     * booted through it at 40M per keystroke. */
+    if (past_gate && (m->inq_cr_wait || m->guest_polls) &&
+        m->rx_poll_streak < RX_BLOCKED_POLLS)
+        quiet = 40000000ull;
+    /* TYPE-AHEAD (the \i escape marks the byte): deliver it the
+     * moment the receiver is free, with no gate, no prompt and no
+     * quiet wait.  Everything above answers the question "is the
+     * guest ready for this byte yet?", and answers it conservatively
+     * because a byte handed over too early is eaten by whatever read
+     * the guest happens to be in -- a boot-ROM probe, or a running
+     * program's own output path, where CP/M's BDOS polls for ^S/^Q/^C
+     * between characters.  \i is the caller saying it WANTS that
+     * reader: the ^S of a flow-control test is aimed at exactly the
+     * output-path poll the pacing exists to dodge, and no amount of
+     * waiting produces it, because a guest that is printing never
+     * looks blocked and never falls silent.  So the choice is left
+     * where it belongs, with whoever wrote the script, one byte at a
+     * time: the gated pacing is unchanged for every byte not marked,
+     * and a marked byte still waits for the receiver to be empty, so
+     * the queue can never overrun the guest or reorder itself. */
+    bool now = m->inq_pos < m->inq_len && m->inq_now[m->inq_pos] &&
+               (!m->inq_mark || m->inq_mark_seen);
+    /* --key-pace: one key at a time, each released only once the guest has
+     * answered the one before it and then gone quiet.  The silence rules
+     * above cannot tell a program that is thinking from one that is waiting,
+     * so a full-screen editor collects the whole script into its type-ahead
+     * and drops it; an answer on the console is proof it acted.  The first
+     * byte has nothing to answer, and a type-ahead byte has asked not to
+     * wait, so neither is held. */
+    bool answered = true;
+    if (m->key_quiet && m->inq_pos > 0 && !now) {
+        quiet = m->key_quiet;
+        answered = m->key_out >= m->key_react ||
+                   (m->key_deadline && c->insns - m->key_fed > m->key_deadline);
+    }
+    if (m->inq_pos < m->inq_len &&
+        (now || (answered && m->shell_up &&
+                 (past_gate || m->prompt_seq >= m->inq_wait_seq) &&
+                 (c->insns - m->last_tx_insn) > quiet))) {
+        uint8_t b = m->inq[m->inq_pos++];
+        scc_rx_console(m, b);
+        if (getenv("C900_FEED_DEBUG"))
+            fprintf(stderr, "[feed %02x '%c' insns=%llu streak=%u polls=%d quiet=%s]\n",
+                    b, (b>=32&&b<127)?b:'.', (unsigned long long)c->insns,
+                    m->rx_poll_streak, m->guest_polls,
+                    now ? "type-ahead" : "waited");
+        m->guest_polls = false;
+        m->key_out = 0;
+        m->key_fed = c->insns;
+        m->inq_cr_wait = (b == '\r' || b == '\n');
+        if (m->inq_cr_wait) m->inq_wait_seq = m->prompt_seq + 1;
         return true;
     }
     return false;
@@ -1090,7 +1224,7 @@ void machine_run(Machine *m){
     console_init();
 
     uint64_t idle = 0;
-    ParkWatch park; park_init(&park, PARK_LOOPS);
+    ParkWatch park; park_init(&park, PARK_TICKS);
     for (;;) {
         if (m->stop) break;
         if (m->insn_limit && c->insns >= m->insn_limit) {
@@ -1117,66 +1251,7 @@ void machine_run(Machine *m){
         /* Poll host console only every 4096 instructions — _kbhit()/read()
          * is a syscall and doing it per-instruction dominates runtime. */
         if (!m->scc_b.rx_avail) {
-            /* Coherent reads the console by Rx interrupt and does not poll RR0
-             * while idle, so a byte goes in once the prompt is up and the
-             * console has been briefly TX-quiet.  After a CR we wait for a
-             * fresh '#' (prompt_seq to advance) before the next command's first
-             * byte, so a still-running command cannot swallow it. */
-            /* Past inq_gateoff the prompt requirement drops; the quiet-console
-             * one still applies.  A curses program prints no `#', so without
-             * this the CR ending its first input is the last byte it can ever
-             * receive.  A position rather than a flag: the shell commands that
-             * set the game up still need the gate. */
-            bool past_gate = (m->inq_gateoff >= 0 &&
-                              m->inq_pos >= m->inq_gateoff);
-            /* The first byte past the gate waits much longer: a curses program
-             * is noisy while it draws and only then goes quiet to read, and
-             * that quiet is the only ready signal available. */
-            uint64_t quiet = (past_gate && m->inq_pos == m->inq_gateoff)
-                             ? 40000000ull : 300000ull;
-            /* Past the gate a command's own output pauses look like silence,
-             * and a byte fed into one is eaten by its output path (CP/M's BDOS
-             * checks for ^S/^C there).  So wait until the guest is provably
-             * reading: an RR0 poll streak, or the long silence for a guest that
-             * never polls.  Per-byte, not sticky -- the boot ROM polls at its
-             * menu, and a sticky flag would then pace an interrupt-driven guest
-             * booted through it at 40M per keystroke. */
-            if (past_gate && (m->inq_cr_wait || m->guest_polls) &&
-                m->rx_poll_streak < RX_BLOCKED_POLLS)
-                quiet = 40000000ull;
-            /* TYPE-AHEAD (the \i escape marks the byte): deliver it the
-             * moment the receiver is free, with no gate, no prompt and no
-             * quiet wait.  Everything above answers the question "is the
-             * guest ready for this byte yet?", and answers it conservatively
-             * because a byte handed over too early is eaten by whatever read
-             * the guest happens to be in -- a boot-ROM probe, or a running
-             * program's own output path, where CP/M's BDOS polls for ^S/^Q/^C
-             * between characters.  \i is the caller saying it WANTS that
-             * reader: the ^S of a flow-control test is aimed at exactly the
-             * output-path poll the pacing exists to dodge, and no amount of
-             * waiting produces it, because a guest that is printing never
-             * looks blocked and never falls silent.  So the choice is left
-             * where it belongs, with whoever wrote the script, one byte at a
-             * time: the gated pacing is unchanged for every byte not marked,
-             * and a marked byte still waits for the receiver to be empty, so
-             * the queue can never overrun the guest or reorder itself. */
-            bool now = m->inq_pos < m->inq_len && m->inq_now[m->inq_pos] &&
-                       (!m->inq_mark || m->inq_mark_seen);
-            if (m->inq_pos < m->inq_len &&
-                (now || (m->shell_up &&
-                         (past_gate || m->prompt_seq >= m->inq_wait_seq) &&
-                         (c->insns - m->last_tx_insn) > quiet))) {
-                uint8_t b = m->inq[m->inq_pos++];
-                scc_rx_console(m, b);
-                if (getenv("C900_FEED_DEBUG"))
-                    fprintf(stderr, "[feed %02x '%c' insns=%llu streak=%u polls=%d quiet=%s]\n",
-                            b, (b>=32&&b<127)?b:'.', (unsigned long long)c->insns,
-                            m->rx_poll_streak, m->guest_polls,
-                            now ? "type-ahead" : "waited");
-                m->guest_polls = false;
-                m->inq_cr_wait = (b == '\r' || b == '\n');
-                if (m->inq_cr_wait) m->inq_wait_seq = m->prompt_seq + 1;
-            } else if ((m->tick_counter & 0x0FFF) == 0) {
+            if (!feed_scripted(m) && (m->tick_counter & 0x0FFF) == 0) {
                 int ch = console_poll_char();
                 if (ch == 0x1D) { m->stop = true; m->stop_why = "Ctrl-] at the console"; }
                                                                /* Ctrl-] quits the emulator;
@@ -1207,7 +1282,7 @@ void machine_run(Machine *m){
         if (m->ct3_running && (m->cio1[0x1E] & 0x80)) {           /* CSC continuous */
             uint32_t tc = ((uint32_t)m->cio1[0x1A]<<8) | m->cio1[0x1B];
             uint32_t period = tc>>1; if (period<2000) period=2000; if (period>60000) period=60000;
-            if (++m->ct3_accum >= period) { m->ct3_accum = 0; m->cio1[0x0C] |= 0x20; } /* set IP */
+            if (++m->ct3_accum >= period) { m->ct3_accum = 0; m->cio1[0x0C] |= 0x20; m->ct3_ticks++; } /* set IP */
         }
 
         /* Vectored-interrupt aggregation, in daisy-chain priority order:
@@ -1279,7 +1354,8 @@ void machine_run(Machine *m){
  * is the decision, and a test that has to boot something can only ever try the
  * few shapes someone thought to build a disk for.  Each case drives park_step
  * over a small budget many times, so "never fires" means never over a span
- * many multiples of the budget -- which for the real PARK_LOOPS is hours. */
+ * many multiples of the budget.  A tick every 64th iteration is the guest's
+ * clock, and the budget is spent in those ticks. */
 static bool park_case(const char *name, uint64_t budget, uint64_t iters,
                       void (*tick)(Machine *, uint64_t), bool want, int *ok){
     Machine *m = machine_new();
@@ -1293,7 +1369,7 @@ static bool park_case(const char *name, uint64_t budget, uint64_t iters,
          * path, exactly the thing that used to reset the old check. */
         bool waking = (i % 64) == 0;
         c->halted = !waking;
-        if (waking) tick(m, i);
+        if (waking) { m->ct3_ticks++; tick(m, i); }
         if (park_step(&p, m)) { fired = true; at = i; }
     }
     if (fired != want) {
@@ -1395,6 +1471,70 @@ static void mark_case_crosstalk(const char *mark, const char *feed,
     free(m->ram); free(m);
 }
 
+/* A guest in the shape of the one --key-pace exists for: it takes a key, works
+ * on it in silence for a long burst while draining and DISCARDING anything
+ * that arrives meanwhile (its own type-ahead), prints one character when it is
+ * done, and only then reads again.  Returns how many of the scripted keys it
+ * actually acted on.
+ *
+ *      key in ──> [ burst: reads and drops keys, prints nothing ] ──> 'K' ──> read
+ *                        ^ silence here is not readiness
+ */
+static void keypace_run(uint64_t quiet, uint64_t deadline, int keys, bool answers,
+                        int *acted, int *fed){
+    const uint64_t STEP = 10000, BURST = 100000000ull;   /* burst >> the 40M silence rule */
+    Machine *m = machine_new();
+    m->shell_up = true;
+    m->inq_gateoff = 0;
+    m->key_quiet = quiet; m->key_react = 1; m->key_deadline = deadline;
+    m->inq = malloc((size_t)keys); m->inq_now = calloc((size_t)keys, sizeof *m->inq_now);
+    m->inq_cap = keys;
+    for (int i = 0; i < keys; i++) m->inq[m->inq_len++] = (uint8_t)('A' + i);
+
+    *acted = 0;
+    uint64_t busy_until = 0;
+    for (uint64_t step = 0; step < 200000; step++) {
+        m->cpu.insns += STEP;
+        bool busy = m->cpu.insns < busy_until;
+        if (scc_read(m, 0, 0, 0) & 0x01) {               /* RR0: anything waiting? */
+            scc_read(m, 0, 0, 8);
+            if (!busy) { (*acted)++; busy_until = m->cpu.insns + BURST; }
+        } else if (busy_until && !busy) {
+            if (answers) scc_write(m, 0, 0, 8, 'K');     /* one character of proof */
+            busy_until = 0;
+        }
+        if (!m->scc_b.rx_avail) feed_scripted(m);
+    }
+    *fed = m->inq_pos;
+    free(m->inq); free(m->inq_now); free(m->ram); free(m);
+}
+
+int keypace_selftest(void){
+    int ok = 1;
+    const int keys = 4;
+    struct { const char *what; uint64_t quiet, deadline; bool answers, count_acted; int want; } c[] = {
+        /* Unpaced, the keys go in on silence alone and the burst eats all but
+         * the first. */
+        { "pacing off loses keys",       0,       0, true,  true,  1    },
+        { "paced keys all arrive", 2000000,       0, true,  true,  keys },
+        /* A guest that never answers: the script waits rather than feeding a
+         * burst that will drop the bytes, and a deadline starts it again. */
+        { "no answer, script waits", 2000000,       0, false, false, 1    },
+        { "deadline releases",       2000000, 40000000ull, false, false, keys },
+    };
+    for (size_t i = 0; i < sizeof c / sizeof *c; i++) {
+        int acted, fed;
+        keypace_run(c[i].quiet, c[i].deadline, keys, c[i].answers, &acted, &fed);
+        int got = c[i].count_acted ? acted : fed;
+        if (got != c[i].want) {
+            printf("\nkey-pace FAIL: %s: %d of %d keys %s, expected %d\n",
+                   c[i].what, got, keys, c[i].count_acted ? "acted on" : "fed", c[i].want);
+            ok = 0;
+        } else printf("\nkey-pace %s PASSED (%d of %d)\n", c[i].what, got, keys);
+    }
+    return ok;
+}
+
 int stop_mark_selftest(void){
     int ok = 1;
     /* Ends on the mark's last character, with output before and after it. */
@@ -1426,35 +1566,139 @@ int stop_mark_selftest(void){
     return ok;
 }
 
+/* ── prompt_gate_selftest (--selftest) ──────────────────────────────────────
+ *
+ * The gate releases scripted input, so a gate that opens on any '#' or '>' in
+ * the guest's output feeds the next command into the middle of a line -- which
+ * is what printing "->" used to do.  The cases run through the real console
+ * transmit path, and the verdict is m->prompt_seq: what the feeder waits on.
+ *
+ * `polls' is a run of RR0 reads with the receiver empty, the guest blocking on
+ * a console read, which confirms a prompt that has no space after it. */
+static void prompt_case_n(const char *name, const char *out, size_t n,
+                          bool polls, uint32_t want, int *ok){
+    Machine *m = machine_new();
+    m->cpu.insns = 2000000;              /* the diagnostics are behind us */
+    for (size_t i = 0; i < n; i++) scc_write(m, 0, 0, 8, (uint8_t)out[i]);
+    if (polls) for (int i = 0; i <= RX_BLOCKED_POLLS; i++) scc_read(m, 0, 0, 0);
+    if (m->prompt_seq != want) {
+        printf("prompt-gate FAIL: %s -- %u prompts, wanted %u\n",
+               name, m->prompt_seq, want);
+        *ok = 0;
+    } else printf("prompt gate %s PASSED (%u prompts)\n", name, want);
+    free(m->ram); free(m);
+}
+
+static void prompt_case(const char *name, const char *out, bool polls,
+                        uint32_t want, int *ok){
+    prompt_case_n(name, out, strlen(out), polls, want, ok);
+}
+
+int prompt_gate_selftest(void){
+    int ok = 1;
+    /* The three prompts that have to keep working. */
+    prompt_case("shell", "\r\n# ", false, 1, &ok);
+    prompt_case("kboot menu", "\r\nboot> ", false, 1, &ok);
+    prompt_case("CP/M, confirmed by a blocked read", "\r\nA>", true, 1, &ok);
+    /* ...and the output that must not be mistaken for one. */
+    prompt_case("an arrow in the output", "\r\nlist -> head\r\n", false, 0, &ok);
+    prompt_case("an arrow alone on a line", "\r\n-> done\r\n", false, 0, &ok);
+    prompt_case("a hash mid-sentence", "\r\ncount # of lines\r\n", false, 0, &ok);
+    prompt_case("a prompt character no one is waiting behind", "\r\nA>x", true, 0, &ok);
+    /* One prompt per prompt, so a script paces one line each. */
+    prompt_case("two prompts", "\r\n# \r\n# ", false, 2, &ok);
+    /* A text file's last record, padded with NULs, then the prompt. */
+    {
+        char s[2 + 66 + 5];
+        memcpy(s, "\r\n", 2);
+        memset(s + 2, 0, 66);
+        memcpy(s + 68, "SDB> ", 5);
+        prompt_case_n("after NUL padding", s, sizeof s, false, 1, &ok);
+    }
+    /* Nothing latches while the power-on diagnostics are still printing. */
+    {
+        Machine *m = machine_new();
+        for (const char *c = "\r\n# "; *c; c++) scc_write(m, 0, 0, 8, (uint8_t)*c);
+        if (m->prompt_seq || m->shell_up) {
+            printf("prompt-gate FAIL: latched during the diagnostics\n"); ok = 0;
+        } else printf("prompt gate boot-time PASSED (no prompts)\n");
+        free(m->ram); free(m);
+    }
+    return ok;
+}
+
 int park_selftest(void){
     int ok = 1;
-    uint64_t budget = 100000;          /* the real run uses PARK_LOOPS */
+    uint64_t budget = 1000;            /* ticks; the real run uses PARK_TICKS */
+    uint64_t iters  = budget * 64;     /* run-loop iterations that spend one budget */
 
     /* Fires, and does not fire early: over one budget it must still be running. */
-    park_case("park caught", budget, budget * 4, park_guest_parked, true, &ok);
+    park_case("park caught", budget, iters * 4, park_guest_parked, true, &ok);
     {
         Machine *m = machine_new();
         ParkWatch p; park_init(&p, budget);
         m->cpu.halted = true;
         bool early = false;
-        for (uint64_t i = 0; i < budget && !early; i++)
+        for (uint64_t i = 0; i < budget && !early; i++) {
+            m->ct3_ticks = i;
             if (park_step(&p, m)) early = true;
+        }
         if (early) { printf("park FAIL: fired inside its own budget\n"); ok = 0; }
         else printf("park budget PASSED (silent for a whole budget)\n");
         free(m->ram); free(m);
     }
 
-    /* ...and never fires on a guest that is getting somewhere.  50 budgets:
-     * at the real PARK_LOOPS that is 25 billion iterations, hours of running. */
-    park_case("working guest spared", budget, budget * 50, park_guest_working,  false, &ok);
-    park_case("printing guest spared", budget, budget * 50, park_guest_printing, false, &ok);
+    /* A guest sleeping on its own clock: parked in signature, but the budget is
+     * guest time, so ten guest minutes of `sleep 600' pass untouched. */
+    {
+        Machine *m = machine_new();
+        ParkWatch p; park_init(&p, PARK_TICKS);
+        m->cpu.halted = true;
+        bool fired = false;
+        for (uint64_t t = 0; t < 60000 && !fired; t++) {    /* 600 guest seconds */
+            m->ct3_ticks = t;
+            if (park_step(&p, m)) fired = true;
+        }
+        if (fired) { printf("park FAIL: a guest asleep for 600s was called parked\n"); ok = 0; }
+        else printf("park sleep PASSED (600 guest seconds of sleep survived)\n");
+        free(m->ram); free(m);
+    }
+
+    /* Scripted input still waiting to go in is a rendezvous, not idling: the
+     * watch holds off past its plain budget, and still ends the run in the end. */
+    {
+        Machine *m = machine_new();
+        ParkWatch p; park_init(&p, budget);
+        m->cpu.halted = true;
+        m->inq_len = 1;                /* one byte queued, none delivered */
+        bool early = false, fired = false;
+        for (uint64_t t = 0; t <= budget * PARK_INPUT_SLACK * 2; t++) {
+            m->ct3_ticks = t;
+            if (park_step(&p, m)) {
+                fired = true;
+                if (t <= budget * PARK_INPUT_SLACK) early = true;
+                break;
+            }
+        }
+        if (early || !fired) {
+            printf("park FAIL: waiting for scripted input %s\n",
+                   early ? "was counted as idling" : "never ended");
+            ok = 0;
+        } else printf("park input-wait PASSED (held off, then ended)\n");
+        free(m->ram); free(m);
+    }
+
+    /* ...and never fires on a guest that is getting somewhere.  50 budgets. */
+    park_case("working guest spared", budget, iters * 50, park_guest_working,  false, &ok);
+    park_case("printing guest spared", budget, iters * 50, park_guest_printing, false, &ok);
 
     {   /* (d) never halted */
         Machine *m = machine_new();
         ParkWatch p; park_init(&p, budget);
         m->cpu.halted = false;
         bool fired = false;
-        for (uint64_t i = 0; i < budget * 50 && !fired; i++) {
+        for (uint64_t i = 0; i < iters * 50 && !fired; i++) {
+            m->ct3_ticks = i / 64;
             park_guest_running(m, i);
             if (park_step(&p, m)) fired = true;
         }

@@ -36,6 +36,12 @@ The command line accepts the following arguments. Value options may be written e
   plus the `\g` and `\i` pacing marks. See "Scripted console input" below.
 - `--input-mark=TEXT` — hold every `\i` (type-ahead) byte until the guest has *printed*
   TEXT on the console. See "Scripted console input" below.
+- `--key-pace=N` — hold each scripted byte until the guest has *answered* the one
+  before it on the console and then been quiet for N instructions (0, the default,
+  is off). See "One key at a time" below.
+- `--key-react=N` — console bytes that count as an answer (default 1).
+- `--key-deadline=N` — instructions an unanswered key waits before going in on the
+  quiet window alone (default 0: wait indefinitely).
 - `--wire=PATH` — attach SCC channel A (the guest's `/dev/tty51`) to the AF_UNIX
   stream socket `PATH`. The console is unaffected. Two emulators pointed at one
   socket — with a host program in the middle copying each end's bytes to the
@@ -92,6 +98,33 @@ printed TEXT on the console. This is the one synchronisation a test can state
 exactly — "send it the moment that appears" — and, unlike an instruction count,
 it does not move when the guest is rebuilt. The mark is a starting gun rather
 than a gate: once seen it stays open, and paced bytes are never affected by it.
+
+### One key at a time
+
+The pacing above reads silence as readiness, and silence is also what a program
+busy thinking looks like. A full-screen program that takes a second of emulated
+time per command therefore gets the whole script inside its first command: it
+collects the bytes into its own type-ahead, throws them away when it redraws,
+and then blocks on a read for a key that has already been spent.
+
+`--key-pace=N` waits for the guest instead of for the clock. A byte goes in only
+once the guest has printed something since the byte before it — proof that it
+acted rather than buffered — and the console has then been quiet for N
+instructions. What that costs is whatever the guest takes, so a key needing a
+billion instructions and a key needing a thousand both go in as soon as they
+can; no fixed count does both. The first byte has nothing to answer and `\i`
+bytes have asked not to wait, so neither is held.
+
+`--key-react=N` raises the number of printed bytes that count as an answer, for a
+guest that echoes the key itself before acting on it. `--key-deadline=N` lets an
+unanswered key go in on the quiet window alone after N instructions; left at 0 a
+script that loses an answer stalls, which is louder than going back to losing
+keys.
+
+```sh
+# one key per command, each released when the editor has finished redrawing
+./c900 --disk=cpm.bin --input="ED TEST.TXT\r\gI" --key-pace=2000000 --max=16000000000
+```
 
 ```sh
 # type ^S into a program's output the instant it announces itself, and

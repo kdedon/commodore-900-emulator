@@ -391,6 +391,7 @@ struct Machine {
 
     /* CIO timer emulation for Coherent system tick */
     uint64_t tick_counter;
+    uint64_t ct3_ticks;      /* system ticks delivered: the guest's own clock, 100 a second */
 
     bool     trace;
     bool     stop;       /* request emulator halt */
@@ -401,8 +402,9 @@ struct Machine {
      * a byte rather than running: an input loop polls continuously, an output
      * path checks at most once per character printed. */
 #define RX_BLOCKED_POLLS 64
-    uint8_t  inq[8192];
-    int      inq_len, inq_pos;
+    uint8_t  *inq;          /* grown as the script is queued: a fixed buffer dropped
+                             * everything past its end without a word */
+    int      inq_len, inq_cap, inq_pos;
     uint64_t last_tx_insn;  /* insn count of the guest's last console activity (output byte
                              * sent, or input byte read). After a long blocked read the
                              * output-side clock is stale, and a byte fed on it lands before
@@ -411,7 +413,7 @@ struct Machine {
     uint32_t prompt_seq;    /* count of '#' prompts printed since boot */
     uint32_t inq_wait_seq;  /* scripted input waits for this prompt_seq before its next byte */
     int      inq_gateoff;   /* queue index from which the prompt gate stops applying (-1 = never) */
-    bool     inq_now[8192]; /* per-byte TYPE-AHEAD flag (the \i escape): this byte is handed to
+    bool     *inq_now;      /* per-byte TYPE-AHEAD flag (the \i escape): this byte is handed to
                              * the receiver the moment it is free, with no gate and no quiet
                              * wait, exactly as a person typing ahead of a running program would
                              * deliver it.  The pacing below decides WHEN a byte the guest is
@@ -423,11 +425,31 @@ struct Machine {
     int      inq_mark_pos;  /* how much of inq_mark has matched the console output so far */
     bool     inq_mark_seen; /* the whole of it has been printed: type-ahead is now open, and
                              * stays open -- the mark is a starting gun, not a gate */
+    /* ── per-key pacing (--key-pace, off at 0) ──
+     * Releases a scripted byte only once the guest has ANSWERED the previous
+     * one on the console and then fallen quiet.  The ready signal is the
+     * guest's own reaction rather than a fixed wait, so a program needing a
+     * billion instructions per keystroke and one needing a thousand are both
+     * fed as fast as they can take it.  Without it a byte goes in on silence
+     * alone, and a program that is merely thinking looks exactly like one that
+     * is waiting -- so the key lands in a type-ahead buffer the program later
+     * throws away. */
+    uint64_t key_quiet;     /* console silence, after the reaction, that releases the next byte */
+    uint32_t key_react;     /* console bytes that count as a reaction (--key-react) */
+    uint64_t key_deadline;  /* instructions after which an unanswered key stops waiting
+                             * for its reaction (--key-deadline; 0 = wait forever) */
+    uint32_t key_out;       /* console bytes the guest has printed since the last byte fed */
+    uint64_t key_fed;       /* insn count when that byte was fed */
     uint32_t rx_poll_streak;/* consecutive console RR0 polls (rx empty) since the last console TX;
                              * at RX_BLOCKED_POLLS the guest is reading, not running */
     bool     guest_polls;   /* a blocked-reading RR0 poll streak has been observed since the last
                              * scripted byte was fed: the current reader polls, so the streak is
                              * a usable ready signal (cleared on every feed -- not sticky) */
+    int      tx_col;        /* column the next console character will be printed at */
+    bool     tx_alnum;      /* everything printed on this line so far is alphanumeric, so a
+                             * prompt character now ends a prompt word ("boot>", "A>") */
+    bool     prompt_pend;   /* a prompt character has been printed and is waiting to be
+                             * confirmed by a space or by a blocked console read */
     bool     at_prompt;     /* the last byte the guest transmitted on the console was a prompt
                              * character ('#' or '>'): it has stopped talking AT a prompt, which
                              * is stronger than having printed one somewhere in its output */
