@@ -821,13 +821,16 @@ void rtc_report(Machine *m, FILE *out){
 
 /* ─────────────── I/O dispatch ─────────────── */
 uint16_t io_read(Machine *m, uint16_t port, bool is_byte, bool special){
-    (void)is_byte;
     if (special) {
         uint8_t low = port & 0xFF;
         if (low == 0xFC || low == 0xF8) {
             return mmu_cmd_read(&m->mmu, (uint8_t)(port>>8));
         }
         return 0;
+    }
+    {   /* the LC card sits on D7:D0; a byte read here arrives on D15:D8 */
+        uint8_t v;
+        if (lc_io_read(m, port, &v)) return is_byte ? (uint16_t)v << 8 : v;
     }
     /* SCC, on D15:D8.  Motherboard U74 at 0x0100-0x017F; the LR board's U31
      * at 0x0300-0x037F and U36 at 0x0380-0x03FF, present only when the board
@@ -861,12 +864,12 @@ uint16_t io_read(Machine *m, uint16_t port, bool is_byte, bool special){
 }
 
 void io_write(Machine *m, uint16_t port, uint16_t data, bool is_byte, bool special){
-    (void)is_byte;
     if (special) {
         uint8_t low = port & 0xFF;
         if (low == 0xFC || low == 0xF8) mmu_cmd_write(&m->mmu, (uint8_t)(port>>8), (uint8_t)data);
         return;
     }
+    if (lc_io_write(m, port, is_byte ? (uint8_t)(data >> 8) : (uint8_t)data)) return;
     {                                         /* SCC (D15:D8) */
         int chip = scc_chip_at(m, port);
         if (chip >= 0) {

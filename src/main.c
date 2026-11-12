@@ -404,6 +404,91 @@ static int shift_selftest(void){
     return ok;
 }
 
+/* ── the LC card (run by --selftest) ───────────────────────────────────────── */
+static void lc_out(Machine *m, uint16_t port, uint8_t v){ io_write(m, port, (uint16_t)v << 8, true, false); }
+static uint8_t lc_in(Machine *m, uint16_t port){ return (uint8_t)(io_read(m, port, true, false) >> 8); }
+static void lc_reg(Machine *m, int r, uint8_t v){ lc_out(m, 0x0181, (uint8_t)r); lc_out(m, 0x0183, v); }
+static uint8_t lc_get(Machine *m, int r){ lc_out(m, 0x0181, (uint8_t)r); return lc_in(m, 0x0183); }
+
+static int lc_selftest(void){
+    int ok = 1;
+    #define LFAIL(...) do { printf("LC card FAIL: " __VA_ARGS__); ok = 0; } while (0)
+    Machine *m = machine_new();
+    if (lc_in(m, 0x01FF) != 0) LFAIL("0x01FF answers with no card\n");
+    lc_out(m, 0x0181, 18);
+    if (lc_in(m, 0x0181) != 0) LFAIL("0x0181 answers with no card\n");
+
+    m->lc_card = true;
+    if (lc_in(m, 0x01FF) != 0xC1) LFAIL("ID reads %02X\n", lc_in(m, 0x01FF));
+    if (!(lc_in(m, 0x0181) & 0x80)) LFAIL("status not ready\n");
+    lc_reg(m, 28, 0x10);
+    if (lc_get(m, 28) != 0x1F) LFAIL("R28 reads %02X\n", lc_get(m, 28));
+    if (lc_get(m, 40) != 0xFF) LFAIL("a missing register does not read FF\n");
+
+    /* "HI" at 0x1000, then a fill of 78 blanks and a copy to the next row */
+    lc_reg(m, 12, 0x10); lc_reg(m, 13, 0x00); lc_reg(m, 1, 80); lc_reg(m, 27, 0);
+    lc_reg(m, 18, 0x10); lc_reg(m, 19, 0x00);
+    lc_reg(m, 31, 'H'); lc_reg(m, 31, 'I');
+    if (lc_get(m, 19) != 0x02) LFAIL("R31 does not advance the update address\n");
+    lc_reg(m, 31, ' '); lc_reg(m, 24, 0x00); lc_reg(m, 30, 77);
+    if (lc_get(m, 18) != 0x10 || lc_get(m, 19) != 80) LFAIL("fill ends at %02X%02X\n", lc_get(m, 18), lc_get(m, 19));
+    lc_reg(m, 32, 0x10); lc_reg(m, 33, 0x00); lc_reg(m, 24, 0x80); lc_reg(m, 30, 80);
+    if (lc_get(m, 32) != 0x10 || lc_get(m, 33) != 80) LFAIL("copy source ends at %02X%02X\n", lc_get(m, 32), lc_get(m, 33));
+    lc_reg(m, 18, 0x10); lc_reg(m, 19, 80);
+    if (lc_get(m, 31) != 'H' || lc_get(m, 31) != 'I' || lc_get(m, 31) != ' ') LFAIL("copy or read-back is wrong\n");
+
+    char buf[LC_SCREEN_TEXT];
+    lc_screen_text(m, buf);
+    if (strncmp(buf, "HI\nHI\n\n", 7) != 0) LFAIL("screen dump starts \"%.12s\"\n", buf);
+
+    /* a 16x4 bitmap at 0x2000 (two character rows of two scan lines), its
+     * attributes at 0x3000 */
+    static const uint8_t bits[] = { 0x80,0x01, 0xFF,0x00, 0x0F,0xF0, 0x00,0x81 };
+    lc_reg(m, 1, 2); lc_reg(m, 6, 2); lc_reg(m, 9, 1);
+    lc_reg(m, 12, 0x20); lc_reg(m, 13, 0x00); lc_reg(m, 18, 0x20); lc_reg(m, 19, 0x00);
+    for (int i = 0; i < 8; i++) lc_reg(m, 31, bits[i]);
+    lc_reg(m, 20, 0x30); lc_reg(m, 21, 0x00); lc_reg(m, 18, 0x30); lc_reg(m, 19, 0x00);
+    lc_reg(m, 31, 0x0C); lc_reg(m, 31, 0x0F); lc_reg(m, 31, 0x02); lc_reg(m, 31, 0x08);
+    lc_reg(m, 26, 0x01); lc_reg(m, 24, 0x00);
+    unsigned char img[16 * 4 * 3 + 32];
+    size_t n;
+    FILE *f = tmpfile();
+    lc_reg(m, 25, 0x00);
+    if (f && lc_bitmap_dump(m, f)) LFAIL("bitmap dump in text mode\n");
+    lc_reg(m, 25, 0x80);
+    if (f && lc_bitmap_dump(m, f)) {
+        rewind(f); n = fread(img, 1, sizeof img, f);
+        if (n != 16 || memcmp(img, "P4\n16 4\n", 8) || memcmp(img + 8, bits, 8)) LFAIL("mono bitmap is wrong\n");
+    } else LFAIL("no mono bitmap\n");
+    if (f) fclose(f);
+    f = tmpfile();
+    lc_reg(m, 24, 0x40);
+    if (f && lc_bitmap_dump(m, f)) {
+        rewind(f); n = fread(img, 1, sizeof img, f);
+        if (n != 16 || img[8] != 0x7F || img[15] != 0x7E) LFAIL("reverse bitmap is wrong\n");
+    } else LFAIL("no reverse bitmap\n");
+    if (f) fclose(f);
+    f = tmpfile();
+    lc_reg(m, 24, 0x00); lc_reg(m, 25, 0xC0);
+    if (f && lc_bitmap_dump(m, f)) {
+        static const uint8_t yel[3] = {0xAA,0xAA,0x00}, grey[3] = {0x55,0x55,0x55},
+                             blu[3] = {0x00,0x00,0xAA}, red[3] = {0xAA,0x00,0x00};
+        rewind(f); n = fread(img, 1, sizeof img, f);
+        const uint8_t *p = img + 12;           /* past "P6\n16 4\n255\n" */
+        if (n != 12 + 16 * 4 * 3 || memcmp(img, "P6\n16 4\n255\n", 12)
+            || memcmp(p, yel, 3) || memcmp(p + 3, grey, 3)
+            || memcmp(p + 15 * 3, (const uint8_t[]){0xFF,0xFF,0xFF}, 3)
+            || memcmp(p + (3 * 16 + 8) * 3, red, 3) || memcmp(p + (2 * 16) * 3, grey, 3)
+            || memcmp(p + (2 * 16 + 4) * 3, blu, 3))
+            LFAIL("colour bitmap is wrong\n");
+    } else LFAIL("no colour bitmap\n");
+    if (f) fclose(f);
+    if (ok) printf("LC card PASSED (ID, registers, R31, fill, copy, screen and bitmap dumps)\n");
+    #undef LFAIL
+    free(m->ram); free(m);
+    return ok;
+}
+
 static int selftest(void){
     Machine *m = machine_new();
     CPU *c = &m->cpu;
@@ -489,6 +574,8 @@ static int selftest(void){
 
     /* Shift counts, byte forms in particular. */
     if (!shift_selftest()) ok = 0;
+
+    if (!lc_selftest()) ok = 0;
 
     free(m->ram); free(m);
     return ok ? 0 : 1;
@@ -622,6 +709,10 @@ static void usage(FILE *out, const char *prog){
         "  --hr             fit the HR board, whose bitmap answers at segments\n"
         "                   3E-3F.  3F answers either way: with no HR board it is\n"
         "                   the motherboard's stack RAM\n"
+        "  --lc             fit the LC card: ID 0xC1 at port 0x01FF and an 8563\n"
+        "                   VDC at 0x0181/0x0183 with 64 KB of RAM, no picture\n"
+        "  --lc-screen=FILE fit the LC card and write its 80x25 text screen to\n"
+        "                   FILE when the run ends (- for stdout)\n"
         "  --lr-scc         fit the LR board's two SCCs (ports 2-5) with no wire\n"
         "                   attached.  Without this, and without a --wireN for one\n"
         "                   of its ports, 0x0300-0x03FF is not decoded at all\n"
@@ -712,7 +803,8 @@ int main(int argc, char **argv){
     const char *fw = "../rom", *disk = "../disk/hdd.bin", *floppy = NULL, *g_input = NULL;
     const char *rtcseed = "host", *wire = NULL, *g_inmark = NULL;
     const char *wireN[SCC_PORTS] = {0};   /* --wire1 .. --wire5, by port number */
-    bool lr_scc = false, rx_overrun = false, hr_board = false;
+    bool lr_scc = false, rx_overrun = false, hr_board = false, lc_card = false;
+    const char *lc_screen = NULL, *lc_bitmap = NULL;
     uint8_t ram_lo = 0x08, ram_hi = 0x17;   /* the 1 MB motherboard, as fitted */
     unsigned long long rtc_ips = 0;
     bool trace = false, dosel = false, wtrace = false;
@@ -765,6 +857,9 @@ int main(int argc, char **argv){
             ram_lo = (uint8_t)lo; ram_hi = (uint8_t)hi;
         }
         else if (!strcmp(argv[i],"--hr")) hr_board = true;
+        else if ((v = opt_value(argv,argc,&i,"--lc-screen"))) { lc_screen = v; lc_card = true; }
+        else if ((v = opt_value(argv,argc,&i,"--lc-bitmap"))) { lc_bitmap = v; lc_card = true; }
+        else if (!strcmp(argv[i],"--lc")) lc_card = true;
         else if (!strcmp(argv[i],"--lr-scc")) lr_scc = true;
         else if (!strcmp(argv[i],"--rx-overrun")) rx_overrun = true;
         else if (!strcmp(argv[i],"--trace")) trace = true;
@@ -883,6 +978,7 @@ int main(int argc, char **argv){
     m->lr_scc = lr_scc;
     m->ram_lo = ram_lo; m->ram_hi = ram_hi;
     m->hr_board = hr_board;
+    m->lc_card = lc_card;
     m->rx_overrun_on = rx_overrun;
     for (int p = SERPORT_MB_A; p < SCC_PORTS; p++) {
         if (!wireN[p]) continue;
@@ -900,6 +996,19 @@ int main(int argc, char **argv){
     fprintf(stderr,"[c900: running boot ROM; serial console below. Ctrl-] to quit (Ctrl-C goes to the guest)]\n");
     machine_run(m);
     wire_close();
+    if (lc_screen) {
+        FILE *f = strcmp(lc_screen, "-") ? fopen(lc_screen, "w") : stdout;
+        if (f) { lc_screen_dump(m, f); if (f != stdout) fclose(f); }
+        else fprintf(stderr, "--lc-screen: cannot write %s\n", lc_screen);
+    }
+    if (lc_bitmap) {
+        FILE *f = strcmp(lc_bitmap, "-") ? fopen(lc_bitmap, "wb") : stdout;
+        if (!f) fprintf(stderr, "--lc-bitmap: cannot write %s\n", lc_bitmap);
+        else {
+            if (!lc_bitmap_dump(m, f)) fprintf(stderr, "--lc-bitmap: the LC card is not in bitmap mode\n");
+            if (f != stdout) fclose(f);
+        }
+    }
     /* One line, whatever ended the run: an idle exit or a doorbell is a normal
      * completion and still exits 0, so the reason goes in the text rather than
      * in the status -- a caller that treats a nonzero status as "the emulator

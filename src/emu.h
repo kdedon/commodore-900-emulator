@@ -333,6 +333,18 @@ typedef struct {
     uint64_t n_read, n_write, n_tick, n_tick_selected;
 } RTC;
 
+/* The LC card's 8563 VDC.  Block operations finish at once, so ready is
+ * always set. */
+#define VDC_NREGS 37
+typedef struct {
+    uint8_t  vram[65536];
+    uint8_t  reg[VDC_NREGS];
+    uint8_t  sel;        /* address register */
+    uint16_t ua, ba;     /* update and block-copy source addresses */
+    uint8_t  da;         /* data latch, read through R31 */
+    uint8_t  wda;        /* last byte written to R31, the fill value */
+} VDC;
+
 struct Machine {
     CPU  cpu;
     MMU  mmu;
@@ -340,6 +352,8 @@ struct Machine {
     uint8_t *ram;        /* full 24-bit space for simplicity (16 MiB) */
     uint8_t  ram_lo, ram_hi;  /* fitted DRAM, inclusive segment numbers (--ram) */
     bool     hr_board;   /* the HR board's bitmap answers at 0x3E-0x3F (--hr) */
+    bool     lc_card;    /* the LC card answers at 0x0181/0x0183/0x01FF (--lc) */
+    VDC      vdc;
 
     SCCChan scc_b;       /* console channel (AD5=0) */
     SCCChan scc_a;       /* second channel */
@@ -504,6 +518,12 @@ int  machine_load_rom(Machine *m, const char *dir);
  * host has to supply one at start-up) and choose the divider rate. */
 void rtc_set_time(Machine *m, int y, int mo, int d, int h, int mi, int s);
 void rtc_report(Machine *m, FILE *out);
+bool    lc_io_read(Machine *m, uint16_t port, uint8_t *v);
+bool    lc_io_write(Machine *m, uint16_t port, uint8_t v);
+#define LC_SCREEN_TEXT (25 * 81 + 1)
+void    lc_screen_text(const Machine *m, char *buf);
+void    lc_screen_dump(const Machine *m, FILE *out);
+bool    lc_bitmap_dump(const Machine *m, FILE *out);
 int  machine_attach_disk(Machine *m, const char *path);
 int  machine_attach_floppy(Machine *m, const char *path);
 void machine_run(Machine *m);
