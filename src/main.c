@@ -299,6 +299,58 @@ static int serial_selftest(void){
     return ok;
 }
 
+/* ── the memory map (run by --selftest) ─────────────────────────────────────
+ * What answers the bus is what the ROM's memory march finds, so the fitted
+ * range and the video apertures are checked here rather than by booting.  The
+ * aperture cases are the interesting ones: the LR board's text RAM is 4 KB
+ * repeated through a 64 KB segment, so it answers a write and readback
+ * anywhere in it and the march walks through the whole segment. */
+static int mem_map_selftest(void){
+    int ok = 1;
+    #define MFAIL(...) do{ printf("memory-map FAIL: " __VA_ARGS__); ok=0; }while(0)
+    Machine *m = machine_new();
+
+    /* The default machine: 1 MB of DRAM, nothing above it but the stack RAM. */
+    phys_write16(m, 0x080000, 0xAAAA);
+    phys_write16(m, 0x170000, 0xAAAA);
+    if (phys_read16(m, 0x080000) != 0xAAAA || phys_read16(m, 0x170000) != 0xAAAA)
+        MFAIL("the 1 MB board does not answer\n");
+    if (phys_read16(m, 0x180000) != 0xFFFF) MFAIL("segment 18 answers by default\n");
+    if (phys_read16(m, 0x370000) != 0xFFFF) MFAIL("text RAM answers with no LR board\n");
+    if (phys_read16(m, 0x3E0000) != 0xFFFF) MFAIL("the bitmap answers with no HR board\n");
+    phys_write16(m, 0x3F0000, 0x1234);       /* motherboard stack RAM, board or no board */
+    if (phys_read16(m, 0x3F0000) != 0x1234) MFAIL("the stack RAM does not answer\n");
+
+    /* Fitted RAM is a range, and nothing above it answers. */
+    m->ram_hi = 0x3F;
+    phys_write16(m, 0x380000, 0x5555);
+    if (phys_read16(m, 0x380000) != 0x5555) MFAIL("fitted segment 38 does not answer\n");
+    if (phys_read16(m, 0x400000) != 0xFFFF) MFAIL("segment 40 answers, past the fitted RAM\n");
+
+    /* The LR board's aperture, mirrored: it answers at the segment base, and a
+     * write 4 KB further up lands on the same 4 KB of text RAM.  It decodes
+     * its segment even where DRAM is configured behind it. */
+    m->lr_scc = true;
+    phys_write16(m, 0x370000, 0xAAAA);
+    if (phys_read16(m, 0x370000) != 0xAAAA) MFAIL("the text RAM does not answer\n");
+    phys_write16(m, 0x371000, 0x5555);
+    if (phys_read16(m, 0x370000) != 0x5555) MFAIL("the text RAM does not mirror at 4 KB\n");
+    phys_write8(m, 0x37F002, 0x42);
+    if (phys_read8(m, 0x370002) != 0x42) MFAIL("the text RAM does not mirror to the top\n");
+    if (phys_read16(m, 0x370FFE) == 0xFFFF) MFAIL("the last word of the text RAM floats\n");
+
+    /* The HR board's bitmap: only with the board fitted. */
+    Machine *h = machine_new();
+    h->hr_board = true;
+    phys_write16(h, 0x3E0000, 0xAAAA);
+    if (phys_read16(h, 0x3E0000) != 0xAAAA) MFAIL("the HR bitmap does not answer\n");
+    if (ok) printf("memory map PASSED (fitted range, mirrored text RAM, HR bitmap)\n");
+    #undef MFAIL
+    free(h->ram); free(h);
+    free(m->ram); free(m);
+    return ok;
+}
+
 static int selftest(void){
     Machine *m = machine_new();
     CPU *c = &m->cpu;
@@ -378,6 +430,9 @@ static int selftest(void){
 
     /* The scripted-input queue: no silent truncation. */
     if (!inq_selftest()) ok = 0;
+
+    /* What answers the bus: fitted RAM and the video apertures. */
+    if (!mem_map_selftest()) ok = 0;
 
     free(m->ram); free(m);
     return ok ? 0 : 1;
@@ -503,6 +558,14 @@ static void usage(FILE *out, const char *prog){
         "                     5  0x03A0  LR SCC #2 chan A    header CN6\n"
         "                   Port 0 is the console and is stdin/stdout, so there is\n"
         "                   no --wire0.  Wiring 2..5 fits the LR board implicitly.\n"
+        "  --ram=LO-HI      fitted motherboard DRAM, as inclusive 64 KB segment\n"
+        "                   numbers in hex (default 08-17, the 1 MB board).  The\n"
+        "                   ROM sizes memory by marching up from segment 08, so it\n"
+        "                   reports whatever is fitted from there -- and walks into\n"
+        "                   any video aperture that adjoins it, as the hardware does\n"
+        "  --hr             fit the HR board, whose bitmap answers at segments\n"
+        "                   3E-3F.  3F answers either way: with no HR board it is\n"
+        "                   the motherboard's stack RAM\n"
         "  --lr-scc         fit the LR board's two SCCs (ports 2-5) with no wire\n"
         "                   attached.  Without this, and without a --wireN for one\n"
         "                   of its ports, 0x0300-0x03FF is not decoded at all\n"
@@ -593,7 +656,8 @@ int main(int argc, char **argv){
     const char *fw = "../rom", *disk = "../disk/hdd.bin", *floppy = NULL, *g_input = NULL;
     const char *rtcseed = "host", *wire = NULL, *g_inmark = NULL;
     const char *wireN[SCC_PORTS] = {0};   /* --wire1 .. --wire5, by port number */
-    bool lr_scc = false, rx_overrun = false;
+    bool lr_scc = false, rx_overrun = false, hr_board = false;
+    uint8_t ram_lo = 0x08, ram_hi = 0x17;   /* the 1 MB motherboard, as fitted */
     unsigned long long rtc_ips = 0;
     bool trace = false, dosel = false, wtrace = false;
     unsigned long long g_max = 0;
@@ -635,6 +699,16 @@ int main(int argc, char **argv){
         else if (!strcmp(argv[i],"--require-stop")) require_stop = true;
         else if ((v = opt_value(argv,argc,&i,"--wire")))     wire = v;
         else if (!strcmp(argv[i],"--wire-trace")) wtrace = true;
+        else if ((v = opt_value(argv,argc,&i,"--ram"))) {
+            char *end;
+            unsigned long lo = strtoul(v,&end,16), hi;
+            if (*end != '-' || (hi = strtoul(end+1,&end,16), *end) || lo > hi || hi > 0xFF) {
+                fprintf(stderr,"--ram: expected LO-HI as hex segment numbers, e.g. 08-3D\n");
+                return 2;
+            }
+            ram_lo = (uint8_t)lo; ram_hi = (uint8_t)hi;
+        }
+        else if (!strcmp(argv[i],"--hr")) hr_board = true;
         else if (!strcmp(argv[i],"--lr-scc")) lr_scc = true;
         else if (!strcmp(argv[i],"--rx-overrun")) rx_overrun = true;
         else if (!strcmp(argv[i],"--trace")) trace = true;
@@ -751,6 +825,8 @@ int main(int argc, char **argv){
      * exists to remove. */
     for (int p = SERPORT_LR_FIRST; p < SCC_PORTS; p++) if (wireN[p]) lr_scc = true;
     m->lr_scc = lr_scc;
+    m->ram_lo = ram_lo; m->ram_hi = ram_hi;
+    m->hr_board = hr_board;
     m->rx_overrun_on = rx_overrun;
     for (int p = SERPORT_MB_A; p < SCC_PORTS; p++) {
         if (!wireN[p]) continue;

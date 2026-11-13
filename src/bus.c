@@ -13,23 +13,45 @@
  * matters for boot: the BIOS probes the video board's VRAM, and when no card
  * responds there it falls back to the serial console for I/O. Backing every
  * segment with RAM would make that probe falsely succeed.
- * On a machine with no graphics card only two things respond:
+ * What responds:
  *   0x00        boot ROM (read-only, 32 KB)
- *   0x08-0x17   1 MB motherboard DRAM (RAM1M)
- * Everything else has no responder — including the graphics-card address
- * space (segs 0x37/0x3A/0x3E/0x3F) and the expansion bus (0x01-0x07,
- * 0x18-0x36). Finding nothing at the video area, the BIOS uses the serial
- * port for console I/O. */
-static bool seg_populated(uint32_t a){
+ *   ram_lo-hi   fitted motherboard DRAM (--ram; 0x08-0x17, 1 MB, by default)
+ *   0x37        the LR board's text RAM, with an LR board fitted
+ *   0x3E        the HR board's bitmap, with an HR board fitted
+ *   0x3F        the same bitmap, or motherboard stack RAM without the board
+ * Everything else has no responder — the rest of the graphics-card address
+ * space and the expansion bus (0x01-0x07, and whatever of 0x18-0x36 is not
+ * fitted).  Finding nothing at the video area, the BIOS uses the serial port
+ * for console I/O.
+ *
+ * THE VIDEO APERTURES ARE WHY MEMORY SIZING IS NOT JUST THE ROM'S ANSWER.  The
+ * ROM sizes memory by writing a pattern at the base of each segment from 0x08
+ * upward and stopping at the first that does not answer.  An aperture in its
+ * path answers, so the march walks through video memory -- blanking it -- and
+ * reports it as RAM.  The text RAM is only 4 KB and MIRRORS sixteen times
+ * across its segment, so a write and readback anywhere in it succeeds, which
+ * is exactly what the march does. */
+#define SEG_LR_TEXT 0x37u         /* LR board: 4 KB of text RAM, mirrored 16x */
+#define SEG_HR_LO   0x3Eu         /* HR board: the bitmap's first segment */
+#define SEG_HR_HI   0x3Fu         /* its second, or motherboard stack RAM */
+
+/* Where a physical address is backed, or -1 for open bus. */
+static int32_t phys_map(Machine *m, uint32_t a){
     uint32_t seg = (a >> 16) & 0xFF;
-    return seg >= 0x08 && seg <= 0x17;             /* 1 MB motherboard DRAM (segs 8-0x17) */
+    /* A fitted board decodes its segment whatever else is configured there, so
+     * the apertures come first: on hardware no DRAM answers behind them. */
+    if (seg == SEG_LR_TEXT && m->lr_scc)   return (int32_t)(a & 0xFF0FFFu); /* mirrored */
+    if (seg == SEG_HR_LO   && m->hr_board) return (int32_t)a;
+    if (seg == SEG_HR_HI)                  return (int32_t)a;
+    if (seg >= m->ram_lo && seg <= m->ram_hi) return (int32_t)a;
+    return -1;
 }
 uint8_t phys_read8(Machine *m, uint32_t a){
     a &= 0x00FFFFFF;
     if (m->flat_mem) return ((a>>16) <= m->flat_maxseg) ? m->ram[a] : 0xFF;
     if (a < ROM_SIZE) return m->rom[a];
-    if (seg_populated(a)) return m->ram[a];
-    return 0xFF;                                    /* open bus */
+    int32_t p = phys_map(m, a);
+    return p >= 0 ? m->ram[p] : 0xFF;               /* else open bus */
 }
 /* Debug write-watch (CSIM_WATCH_PHYS="lo-hi" hex, physical): logs every
  * store into [lo,hi] with the writing instruction's PC. Parsed lazily on
@@ -52,7 +74,8 @@ void phys_write8(Machine *m, uint32_t a, uint8_t v){
     if (watch_on && a >= watch_lo && a <= watch_hi) watch_hit(m, a, v, 8, "w8 ");
     if (m->flat_mem) { if ((a>>16) <= m->flat_maxseg) m->ram[a] = v; return; }
     if (a < ROM_SIZE) return;                       /* ROM read-only */
-    if (seg_populated(a)) m->ram[a] = v;            /* else float — ignore */
+    int32_t p = phys_map(m, a);
+    if (p >= 0) m->ram[p] = v;                      /* else float — ignore */
 }
 uint16_t phys_read16(Machine *m, uint32_t a){
     a &= 0x00FFFFFF;
@@ -66,7 +89,8 @@ uint16_t phys_read16(Machine *m, uint32_t a){
                 m->cpu.opcode[0], (unsigned long long)m->cpu.insns);
     if (a < ROM_SIZE-1) return ((uint16_t)m->rom[a]<<8) | m->rom[a+1];   /* ROM word */
     uint32_t seg = (a>>16)&0xFF;
-    if (seg>=0x08 && seg<=0x17) return ((uint16_t)m->ram[a]<<8) | m->ram[a+1]; /* DRAM word */
+    if (seg!=SEG_LR_TEXT && seg>=m->ram_lo && seg<=m->ram_hi)
+        return ((uint16_t)m->ram[a]<<8) | m->ram[a+1];                     /* DRAM word */
     return ((uint16_t)phys_read8(m,a)<<8) | phys_read8(m,a+1);          /* edge / open bus */
 }
 void phys_write16(Machine *m, uint32_t a, uint16_t v){
@@ -76,7 +100,8 @@ void phys_write16(Machine *m, uint32_t a, uint16_t v){
     if (watch_on && a+1 >= watch_lo && a <= watch_hi) watch_hit(m, a, v, 16, "w16");
     if (a < ROM_SIZE) return;                                           /* ROM read-only */
     uint32_t seg = (a>>16)&0xFF;
-    if (seg>=0x08 && seg<=0x17){ m->ram[a]=(uint8_t)(v>>8); m->ram[a+1]=(uint8_t)v; return; }
+    if (seg!=SEG_LR_TEXT && seg>=m->ram_lo && seg<=m->ram_hi){
+        m->ram[a]=(uint8_t)(v>>8); m->ram[a+1]=(uint8_t)v; return; }
     phys_write8(m,a,(uint8_t)(v>>8)); phys_write8(m,a+1,(uint8_t)v);    /* edge / open bus */
 }
 
@@ -938,6 +963,7 @@ Machine *machine_new(void){
     m->ram = calloc(PHYS_SIZE + 2, 1);
     m->cpu.m = m;
     m->hdc_cmdblk = 0x080000;
+    m->ram_lo = 0x08; m->ram_hi = 0x17;   /* 1 MB of motherboard DRAM */
     m->tx_alnum = true;      /* nothing printed on this line yet */
     m->cio1_reset = true;
     m->cio2_reset = true;
@@ -961,8 +987,9 @@ int machine_load_rom(Machine *m, const char *dir){
     size_t nh = fread(hi, 1, sizeof hi, fh);
     size_t nl = fread(lo, 1, sizeof lo, fl);
     fclose(fh); fclose(fl);
-    if (nh != nl) return -2;
-    for (size_t i=0;i<nh;i++){ m->rom[2*i] = hi[i]; m->rom[2*i+1] = lo[i]; }
+    if (nh != nl || nh == 0) return -2;
+    /* A 32 KB pair (23128s) repeats through the 64 KB socket decode. */
+    for (size_t i=0;i<ROM_SIZE/2;i++){ m->rom[2*i] = hi[i%nh]; m->rom[2*i+1] = lo[i%nl]; }
     return 0;   /* stock ROM — the full power-on memory test runs unmodified */
 }
 

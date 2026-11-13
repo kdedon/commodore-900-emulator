@@ -236,7 +236,7 @@ uint32_t mmu_translate(MMU *u, uint8_t sn, uint16_t off,
 
 /* ─────────────────────────── Machine / bus ─────────────────────────── */
 
-#define ROM_SIZE   0x8000u        /* 32 KiB */
+#define ROM_SIZE   0x10000u       /* 64 KiB: segment 0 is all ROM */
 #define PHYS_SIZE  0x1000000u     /* 24-bit physical space */
 
 /* One Z8030 SCC channel. Channel B is the C900 console; Channel A is the
@@ -338,6 +338,8 @@ struct Machine {
     MMU  mmu;
     uint8_t rom[ROM_SIZE];
     uint8_t *ram;        /* full 24-bit space for simplicity (16 MiB) */
+    uint8_t  ram_lo, ram_hi;  /* fitted DRAM, inclusive segment numbers (--ram) */
+    bool     hr_board;   /* the HR board's bitmap answers at 0x3E-0x3F (--hr) */
 
     SCCChan scc_b;       /* console channel (AD5=0) */
     SCCChan scc_a;       /* second channel */
