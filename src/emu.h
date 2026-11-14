@@ -162,6 +162,8 @@ typedef struct {
 
     Machine *m;
     uint64_t insns;
+    uint64_t cyc;          /* modelled Z8001 clock cycles */
+    uint64_t nio;          /* I/O bus cycles */
     uint8_t  serviced;     /* irq bit serviced on the last step (0 if none) */
 } CPU;
 
@@ -334,7 +336,8 @@ typedef struct {
 } RTC;
 
 /* The LC card's 8563 VDC.  Block operations finish at once, so ready is
- * always set. */
+ * always set, unless `slots' times each RAM access by the chip's free
+ * cycles (--lc-slots). */
 #define VDC_NREGS 37
 typedef struct {
     uint8_t  vram[65536];
@@ -343,6 +346,13 @@ typedef struct {
     uint16_t ua, ba;     /* update and block-copy source addresses */
     uint8_t  da;         /* data latch, read through R31 */
     uint8_t  wda;        /* last byte written to R31, the fill value */
+    bool     slots;      /* time RAM accesses (--lc-slots) */
+    uint64_t slots_ips;  /* instructions per second of the chip's time */
+    uint64_t done;       /* character clock the last access finishes at */
+    uint64_t nbusy, nstat, nwait;  /* busy status reads, all status reads, accesses */
+    uint64_t busycc;     /* character clocks the CPU found the chip busy */
+    uint64_t hz;         /* CPU clock: time the chip by modelled cycles */
+    uint64_t psel, pstat, pbusy, pwr, pupd, preg, pblk, pfill, pcopy;  /* profile */
 } VDC;
 
 struct Machine {
@@ -538,6 +548,13 @@ void rtc_set_time(Machine *m, int y, int mo, int d, int h, int mi, int s);
 void rtc_report(Machine *m, FILE *out);
 bool    lc_io_read(Machine *m, uint16_t port, uint8_t *v);
 bool    lc_io_write(Machine *m, uint16_t port, uint8_t v);
+void    lc_slot_report(Machine *m, FILE *out);
+void    prof_step(Machine *m);
+void    hrwatch_step(Machine *m);
+void    prof_mark(Machine *m);
+void    prof_call(CPU *c);
+void    prof_sc(CPU *c);
+void    prof_ret(CPU *c);
 #define LC_SCREEN_TEXT (25 * 81 + 1)
 void    lc_screen_text(const Machine *m, char *buf);
 void    lc_screen_dump(const Machine *m, FILE *out);

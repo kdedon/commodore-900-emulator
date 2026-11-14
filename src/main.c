@@ -805,6 +805,9 @@ static void usage(FILE *out, const char *prog){
         "                   the motherboard's stack RAM\n"
         "  --lc             fit the LC card: ID 0xC1 at port 0x01FF and an 8563\n"
         "                   VDC at 0x0181/0x0183 with 64 KB of RAM, no picture\n"
+        "  --lc-slots[=N]   the LC card, with each RAM access timed by the chip's\n"
+        "                   free cycles; ready stays clear until it is done.  N is\n"
+        "                   the CPU's instructions a second (default 1500000)\n"
         "  --lc-screen=FILE fit the LC card and write its 80x25 text screen to\n"
         "                   FILE when the run ends (- for stdout)\n"
         "  --key=T:HH       press keyboard scancode HH (hex; bit 7 = release) T loop\n"
@@ -903,10 +906,10 @@ int main(int argc, char **argv){
     const char *fw = "../rom", *disk = "../disk/hdd.bin", *floppy = NULL, *g_input = NULL;
     const char *rtcseed = "host", *wire = NULL, *g_inmark = NULL;
     const char *wireN[SCC_PORTS] = {0};   /* --wire1 .. --wire5, by port number */
-    bool lr_scc = false, rx_overrun = false, hr_board = false, lc_card = false;
+    bool lr_scc = false, rx_overrun = false, hr_board = false, lc_card = false, lc_slots = false;
     const char *lc_screen = NULL, *lc_bitmap = NULL;
     uint8_t ram_lo = 0x08, ram_hi = 0x17;   /* the 1 MB motherboard, as fitted */
-    unsigned long long rtc_ips = 0;
+    unsigned long long rtc_ips = 0, slots_ips = 1500000;
     bool trace = false, dosel = false, wtrace = false;
     unsigned long long g_max = 0;
     /* the same silence the scripted-input pacing uses for its longest wait */
@@ -975,6 +978,8 @@ int main(int argc, char **argv){
         else if ((v = opt_value(argv,argc,&i,"--lc-screen"))) { lc_screen = v; lc_card = true; }
         else if ((v = opt_value(argv,argc,&i,"--lc-bitmap"))) { lc_bitmap = v; lc_card = true; }
         else if (!strcmp(argv[i],"--lc")) lc_card = true;
+        else if (!strcmp(argv[i],"--lc-slots")) lc_card = lc_slots = true;
+        else if ((v = opt_value(argv,argc,&i,"--lc-slots"))) { lc_card = lc_slots = true; slots_ips = strtoull(v,0,0); }
         else if (!strcmp(argv[i],"--lr-scc")) lr_scc = true;
         else if (!strcmp(argv[i],"--rx-overrun")) rx_overrun = true;
         else if (!strcmp(argv[i],"--trace")) trace = true;
@@ -1097,6 +1102,12 @@ int main(int argc, char **argv){
     m->ram_lo = ram_lo; m->ram_hi = ram_hi;
     m->hr_board = hr_board;
     m->lc_card = lc_card;
+    m->vdc.slots = lc_slots;
+    m->vdc.slots_ips = slots_ips ? slots_ips : 1500000;
+    { extern unsigned cyc_mem, cyc_io;
+      if (getenv("C900_CYC_MEM")) cyc_mem = (unsigned)atoi(getenv("C900_CYC_MEM"));
+      if (getenv("C900_CYC_IO")) cyc_io = (unsigned)atoi(getenv("C900_CYC_IO")); }
+    if (getenv("C900_CPU_HZ")) m->vdc.hz = strtoull(getenv("C900_CPU_HZ"), 0, 0);
     m->rx_overrun_on = rx_overrun;
     for (int p = SERPORT_MB_A; p < SCC_PORTS; p++) {
         if (!wireN[p]) continue;
@@ -1114,6 +1125,7 @@ int main(int argc, char **argv){
     fprintf(stderr,"[c900: running boot ROM; serial console below. Ctrl-] to quit (Ctrl-C goes to the guest)]\n");
     machine_run(m);
     wire_close();
+    if (lc_slots) lc_slot_report(m, stderr);
     if (lc_screen) {
         FILE *f = strcmp(lc_screen, "-") ? fopen(lc_screen, "w") : stdout;
         if (f) { lc_screen_dump(m, f); if (f != stdout) fclose(f); }

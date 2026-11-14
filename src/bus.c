@@ -36,8 +36,19 @@
 #define SEG_HR_HI   0x3Fu         /* its second, or motherboard stack RAM */
 
 /* Where a physical address is backed, or -1 for open bus. */
+unsigned long long hr_acc;        /* bytes of HR bitmap accessed */
 static int32_t phys_map(Machine *m, uint32_t a){
     uint32_t seg = (a >> 16) & 0xFF;
+    if ((seg == SEG_HR_LO || seg == SEG_HR_HI) && m->hr_board) {
+        /* C900_HR_WAIT=n: n wait clocks a word access to the bitmap. */
+        static int hrwait = -1;
+        static unsigned half;
+        if (hrwait < 0) hrwait = getenv("C900_HR_WAIT") ? atoi(getenv("C900_HR_WAIT")) : 0;
+        hr_acc++;
+        half += (unsigned)hrwait;
+        m->cpu.cyc += half >> 1;
+        half &= 1;
+    }
     /* A fitted board decodes its segment whatever else is configured there, so
      * the apertures come first: on hardware no DRAM answers behind them. */
     if (seg == SEG_LR_TEXT && m->lr_scc)   return (int32_t)(a & 0xFF0FFFu); /* mirrored */
@@ -264,6 +275,9 @@ static int mark_advance(const char *mark, int pos, uint8_t v){
  * AFTER the character has been handed on, so the transcript (or the wire)
  * contains the mark that ended the run. */
 static void stop_mark_watch(Machine *m, int port, uint8_t v){
+    static const char *pm; static int pp[8], pinit;
+    if (!pinit) { pinit = 1; pm = getenv("C900_PROF_MARK"); }
+    if (pm) { pp[port] = mark_advance(pm, pp[port], v); if (pm[pp[port]] == '\0') { pp[port] = 0; prof_mark(m); } }
     if (!m->stop_mark) return;
     int *pos = &m->stop_mark_pos[port];
     *pos = mark_advance(m->stop_mark, *pos, v);
@@ -273,6 +287,12 @@ static void stop_mark_watch(Machine *m, int port, uint8_t v){
     }
 }
 
+/* The --key/--mouse clock: loop ticks, or modelled cycles under C900_HW_CYC. */
+static uint64_t hw_clock(Machine *m){
+    static int cyc = -1;
+    if (cyc < 0) cyc = getenv("C900_HW_CYC") != NULL;
+    return cyc ? m->cpu.cyc : m->tick_counter;
+}
 static void scc_write(Machine *m, int chip, int chan, int addrReg, uint8_t v){
     SCCChan *ch = scc_chan_of(m, chip, chan);
     if (!ch) return;
@@ -318,7 +338,7 @@ static void scc_write(Machine *m, int chip, int chan, int addrReg, uint8_t v){
              * mark_advance(). */
             if (m->hw_mark && !m->hw_armed) {
                 m->hw_mark_pos = mark_advance(m->hw_mark, m->hw_mark_pos, v);
-                if (m->hw_mark[m->hw_mark_pos] == '\0') { m->hw_armed = true; m->hw_t0 = m->tick_counter; }
+                if (m->hw_mark[m->hw_mark_pos] == '\0') { m->hw_armed = true; m->hw_t0 = hw_clock(m); }
             }
             if (m->inq_mark && !m->inq_mark_seen) {
                 m->inq_mark_pos = mark_advance(m->inq_mark, m->inq_mark_pos, v);
@@ -830,7 +850,7 @@ static void hw_service(Machine *m){
     if (!m->hw_armed) return;
     while (m->hwev_next < m->nhwev) {
         struct hwev *e = &m->hwev[m->hwev_next];
-        if (m->tick_counter - m->hw_t0 < e->at) return;
+        if (hw_clock(m) - m->hw_t0 < e->at) return;
         if (e->key >= 0) {
             if (m->pa_irf) return;
             m->pa_data = (uint8_t)((e->key & 0x7F) | 0x80);
@@ -872,11 +892,22 @@ uint16_t io_read(Machine *m, uint16_t port, bool is_byte, bool special){
             return (uint16_t)scc_read(m, chip, chan, reg) << 8;
         }
     }
+    /* C900_HRCONF=n: the HR board's 404H mode field reads n (1 = colour). */
+    if (m->hr_board && (port & 0xFFFE) == 0x0404) {
+        static int hrconf = -2;
+        if (hrconf == -2) {
+            const char *e = getenv("C900_HRCONF");
+            hrconf = e ? atoi(e) : -1;
+        }
+        if (hrconf >= 0) return (uint16_t)hrconf;
+    }
     if (m->mouse_on && (port & 0xFFFC) == 0x0400) {
         uint16_t w = (port & 2) ? (m->mouse_y & 0x3FF)
                                 : (uint16_t)((m->mouse_x & 0x3FF) | (m->mouse_btn & 7) << 13);
         return is_byte ? (uint16_t)(w & 0xFF00) : w;
     }
+    /* The mouse port is on the hi-res board; in its place the bus floats high. */
+    if (m->lc_card && (port & 0xFFFC) == 0x0400) return 0xFFFF;
     /* CIO #1 0x0000-0x007F — plain register file (read back what was written).
      * In reset all regs read 0 except MICR. */
     if ((port & 0xFF80) == 0x0000) {
@@ -1321,7 +1352,8 @@ void machine_run(Machine *m){
     cpu_reset(c);
     console_init();
 
-    uint64_t idle = 0;
+    uint64_t idle = 0, tick_last = 0;
+    uint64_t tickcyc = getenv("C900_TICK_CYC") ? strtoull(getenv("C900_TICK_CYC"), 0, 0) : 0;
     ParkWatch park; park_init(&park, PARK_TICKS);
     for (;;) {
         if (m->stop) break;
@@ -1377,7 +1409,14 @@ void machine_run(Machine *m){
          * We approximate the PCLK/2 period with an instruction accumulator
          * scaled from the programmed time constant, so the tick rate tracks
          * what the kernel set up (TC=30000 → ~100 Hz-equivalent cadence). */
-        if (m->ct3_running && (m->cio1[0x1E] & 0x80)) {           /* CSC continuous */
+        if (tickcyc) {
+            /* C900_TICK_CYC: the tick every that many modelled clocks, with
+             * a halted CPU's time passing at 6 clocks an iteration. */
+            if (c->halted) c->cyc += 6;
+            if (m->ct3_running && (m->cio1[0x1E] & 0x80) && c->cyc - tick_last >= tickcyc) {
+                tick_last = c->cyc; m->cio1[0x0C] |= 0x20; m->ct3_ticks++;
+            }
+        } else if (m->ct3_running && (m->cio1[0x1E] & 0x80)) {           /* CSC continuous */
             uint32_t tc = ((uint32_t)m->cio1[0x1A]<<8) | m->cio1[0x1B];
             uint32_t period = tc>>1; if (period<2000) period=2000; if (period>60000) period=60000;
             if (++m->ct3_accum >= period) { m->ct3_accum = 0; m->cio1[0x0C] |= 0x20; m->ct3_ticks++; } /* set IP */
@@ -1432,6 +1471,8 @@ void machine_run(Machine *m){
         }
 
         cpu_step(c);
+        prof_step(m);
+        hrwatch_step(m);
 
         /* The disk VI is a one-shot (cleared when serviced); the CT3 IP is
          * level and is cleared by the clock ISR writing the CS register. */

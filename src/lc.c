@@ -33,8 +33,63 @@ static bool in_vblank(Machine *m){
     return m->cpu.insns % frame >= frame - frame / 5;
 }
 
+/* Character clocks (2 MHz) since the start, at slots_ips instructions a
+ * second of the chip's time. */
+static uint64_t vdc_now(Machine *m){
+    if (m->vdc.hz) return m->cpu.cyc * 2000000ull / m->vdc.hz;
+    return m->cpu.insns * 2000000ull / m->vdc.slots_ips;
+}
+
+/* Whether the chip's RAM is free for the CPU at character clock t, after the
+ * chip's own fetches: in each line the character fetches fill the displayed
+ * columns, refresh takes R36+1 columns after them, two columns either side of
+ * the line end are never used, and each row's screen and attribute fetches
+ * take the first free columns of its lines. */
+static bool vdc_free(const VDC *v, uint64_t t){
+    unsigned ht = v->reg[0] + 1u, hd = v->reg[1], drr = v->reg[36] & 0x0F;
+    unsigned sl = (v->reg[9] & 0x1F) + 1u, rows = v->reg[6];
+    unsigned lines = (v->reg[4] + 1u) * sl + (v->reg[5] & 0x1F);
+    bool bitmap = v->reg[25] & 0x80, attr = v->reg[25] & 0x40;
+    if (hd + drr + 8 >= ht || rows * sl > lines) return true;  /* not set up */
+    unsigned col = (unsigned)(t % ht), line = (unsigned)(t / ht % lines);
+    if (col < 2 || col >= ht - 3) return false;
+    if (col >= hd && col <= hd + drr) return false;
+    if (line >= rows * sl) return true;
+    if (col < hd) return false;
+    unsigned per = ht - 3 - hd - drr - 1;            /* free columns a line */
+    unsigned fetch = (bitmap ? 0 : hd) + (attr ? hd : 0);
+    unsigned before = line % sl * per + (col - hd - drr - 1);
+    return before >= fetch;
+}
+
+/* The CPU starts an access of n RAM cycles: it finishes n free columns after
+ * the later of now and the end of the last one. */
+static void vdc_access(Machine *m, unsigned n){
+    VDC *v = &m->vdc;
+    if (!v->slots) return;
+    uint64_t t = vdc_now(m);
+    if (t < v->done) t = v->done;
+    v->nwait++;
+    while (n) { t++; if (vdc_free(v, t)) n--; }
+    v->done = t;
+}
+
 static uint8_t vdc_status(Machine *m){
-    return (uint8_t)(0x80 | (in_vblank(m) ? 0x20 : 0) | 0x01);
+    VDC *v = &m->vdc;
+    uint8_t ready = 0x80;
+    if (v->slots) {
+        uint64_t t = vdc_now(m);
+        v->nstat++;
+        if (t < v->done) { ready = 0; v->nbusy++; v->pbusy++; v->busycc += v->done - t; }
+    }
+    return (uint8_t)(ready | (in_vblank(m) ? 0x20 : 0) | 0x01);
+}
+
+void lc_slot_report(Machine *m, FILE *out){
+    VDC *v = &m->vdc;
+    fprintf(out, "lc slots: %llu accesses, %llu status reads, %llu busy\n",
+            (unsigned long long)v->nwait, (unsigned long long)v->nstat,
+            (unsigned long long)v->nbusy);
 }
 
 static uint8_t vdc_read(VDC *v){
@@ -84,8 +139,11 @@ bool lc_io_read(Machine *m, uint16_t port, uint8_t *v){
     if (!m->lc_card) return false;
     switch (port) {
     case LC_PORT_ID:   *v = LC_ID; return true;
-    case LC_PORT_ADDR: *v = vdc_status(m); return true;
-    case LC_PORT_DATA: *v = vdc_read(&m->vdc); return true;
+    case LC_PORT_ADDR: m->vdc.pstat++; *v = vdc_status(m); return true;
+    case LC_PORT_DATA:
+        *v = vdc_read(&m->vdc);
+        if (m->vdc.sel == 31) vdc_access(m, 1);
+        return true;
     }
     return false;
 }
@@ -93,8 +151,20 @@ bool lc_io_read(Machine *m, uint16_t port, uint8_t *v){
 bool lc_io_write(Machine *m, uint16_t port, uint8_t v){
     if (!m->lc_card) return false;
     switch (port) {
-    case LC_PORT_ADDR: m->vdc.sel = v & 0x3F; return true;
-    case LC_PORT_DATA: vdc_write(&m->vdc, v); return true;
+    case LC_PORT_ADDR: m->vdc.psel++; m->vdc.sel = v & 0x3F; return true;
+    case LC_PORT_DATA: {
+        uint8_t s = m->vdc.sel;
+        unsigned n = v ? v : 256;
+        vdc_write(&m->vdc, v);
+        if (s == 31) m->vdc.pwr++;
+        else if (s == 18 || s == 19) m->vdc.pupd++;
+        else if (s == 30) { m->vdc.pblk++; if (m->vdc.reg[24] & 0x80) m->vdc.pcopy += n; else m->vdc.pfill += n; }
+        else m->vdc.preg++;
+        if (s == 31) vdc_access(m, 2);
+        else if (s == 18 || s == 19) vdc_access(m, 1);
+        else if (s == 30) vdc_access(m, m->vdc.reg[24] & 0x80 ? 2 * n : n);
+        return true;
+    }
     case LC_PORT_ID:   return true;
     }
     return false;

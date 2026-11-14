@@ -18,6 +18,11 @@
  * 16 general 16-bit regs R0..R15. Byte regs RH0..RH7 map to r<8 (high byte of
  * R0..R7) and RL0..RL7 to r 8..15 (low byte of R0..R7). Word/long/quad regs
  * alias overlapping ranges; long uses an even-aligned pair, quad a mod-4 group. */
+/* Clocks a memory and an I/O bus cycle take: 3 and 4 at the stock 6 MHz.
+ * A faster CPU waits for its memory and runs I/O cycles at the stock clock;
+ * C900_CYC_MEM and C900_CYC_IO set those in its own clocks. */
+unsigned cyc_mem = 3, cyc_io = 4;
+
 static uint8_t  rb(CPU *c, uint8_t r){ return r<8 ? (uint8_t)(c->R[r]>>8) : (uint8_t)c->R[r-8]; }     /* read byte reg */
 static void     wb(CPU *c, uint8_t r, uint8_t v){ if(r<8) c->R[r]=(uint16_t)(v<<8)|(c->R[r]&0x00FF); else c->R[r-8]=(c->R[r-8]&0xFF00)|v; } /* write byte reg */
 static uint16_t rw(CPU *c, uint8_t r){ return c->R[r&0x0F]; }                                          /* read word reg */
@@ -111,6 +116,7 @@ static uint16_t ifetch16(CPU *c, uint32_t a){
 }
 /* Data word read. */
 static uint16_t mem_r16(CPU *c, uint32_t a){
+    c->cyc += cyc_mem;
     uint8_t sn=(a>>16)&0x7F; uint16_t off=a&0xFFFF; bool f=false;
     uint32_t p = mmu_translate(&c->m->mmu, sn, off, false, !SYSMODE(c), false, &f);
     if (f) c->fault = true;
@@ -121,6 +127,7 @@ static uint16_t mem_r16(CPU *c, uint32_t a){
 }
 /* Data word write (on fault, skip the store — the trap will re-run the instr). */
 static void mem_w16(CPU *c, uint32_t a, uint16_t v){
+    c->cyc += cyc_mem;
     uint8_t sn=(a>>16)&0x7F; uint16_t off=a&0xFFFF; bool f=false;
     uint32_t p = mmu_translate(&c->m->mmu, sn, off, true, !SYSMODE(c), false, &f);
     if (f) { c->fault = true; return; }
@@ -128,6 +135,7 @@ static void mem_w16(CPU *c, uint32_t a, uint16_t v){
 }
 /* Data byte read. */
 static uint8_t mem_r8(CPU *c, uint32_t a){
+    c->cyc += cyc_mem;
     uint8_t sn=(a>>16)&0x7F; uint16_t off=a&0xFFFF; bool f=false;
     uint32_t p = mmu_translate(&c->m->mmu, sn, off, false, !SYSMODE(c), false, &f);
     if (f) c->fault = true;
@@ -135,6 +143,7 @@ static uint8_t mem_r8(CPU *c, uint32_t a){
 }
 /* Data byte write. */
 static void mem_w8(CPU *c, uint32_t a, uint8_t v){
+    c->cyc += cyc_mem;
     uint8_t sn=(a>>16)&0x7F; uint16_t off=a&0xFFFF; bool f=false;
     uint32_t p = mmu_translate(&c->m->mmu, sn, off, true, !SYSMODE(c), false, &f);
     if (f) { c->fault = true; return; }
@@ -379,11 +388,11 @@ static void exec_branch(CPU *c, const CtrlWord *w){
         case BranchJP_X: if (cond_true(c,nib3(op))) c->pc=addr_add(seg_addr_op(c,1), rw(c,nib2(op))); break; /* JP cc, addr(Rx) */
         case BranchJP_IR: if (cond_true(c,nib3(op))) c->pc=addr_from_reg(c,nib2(op)); break;              /* JP cc, @Rs */
         case BranchJR: { uint8_t cc=nib1(op); if (cond_true(c,cc)) c->pc=rel_pc(c,(int32_t)(int8_t)(op&0xFF)*2); break; } /* JR cc, disp8 (signed, ×2) */
-        case BranchCALL_DA: { uint32_t t=seg_addr_op(c,1); push_word(c,(uint16_t)c->pc); if (SEG(c)) push_word(c,(uint16_t)(make_seg(c->pc)>>16)); c->pc=t; break; } /* CALL addr */
-        case BranchCALL_X: { uint32_t t=addr_add(seg_addr_op(c,1),rw(c,nib2(op))); push_word(c,(uint16_t)c->pc); if (SEG(c)) push_word(c,(uint16_t)(make_seg(c->pc)>>16)); c->pc=t; break; } /* CALL addr(Rx) */
-        case BranchCALL_IR: { uint32_t t=addr_from_reg(c,nib2(op)); push_word(c,(uint16_t)c->pc); if (SEG(c)) push_word(c,(uint16_t)(make_seg(c->pc)>>16)); c->pc=t; break; } /* CALL @Rs */
-        case BranchCALR: { int8_t d=(int8_t)(op&0xFF); uint32_t t=rel_pc(c,(int32_t)d*2); push_word(c,(uint16_t)c->pc); if (SEG(c)) push_word(c,(uint16_t)(make_seg(c->pc)>>16)); c->pc=t; break; } /* CALR disp8 */
-        case BranchCALR12: { int32_t raw=op&0x0FFF; if (raw&0x0800) raw|=~0x0FFF; uint32_t t=rel_pc(c,-raw*2); push_word(c,(uint16_t)c->pc); if (SEG(c)) push_word(c,(uint16_t)(make_seg(c->pc)>>16)); c->pc=t; break; } /* CALR disp12 (sign-extended, branches backward: −raw×2) */
+        case BranchCALL_DA: { uint32_t t=seg_addr_op(c,1); push_word(c,(uint16_t)c->pc); if (SEG(c)) push_word(c,(uint16_t)(make_seg(c->pc)>>16)); c->pc=t; prof_call(c); break; } /* CALL addr */
+        case BranchCALL_X: { uint32_t t=addr_add(seg_addr_op(c,1),rw(c,nib2(op))); push_word(c,(uint16_t)c->pc); if (SEG(c)) push_word(c,(uint16_t)(make_seg(c->pc)>>16)); c->pc=t; prof_call(c); break; } /* CALL addr(Rx) */
+        case BranchCALL_IR: { uint32_t t=addr_from_reg(c,nib2(op)); push_word(c,(uint16_t)c->pc); if (SEG(c)) push_word(c,(uint16_t)(make_seg(c->pc)>>16)); c->pc=t; prof_call(c); break; } /* CALL @Rs */
+        case BranchCALR: { int8_t d=(int8_t)(op&0xFF); uint32_t t=rel_pc(c,(int32_t)d*2); push_word(c,(uint16_t)c->pc); if (SEG(c)) push_word(c,(uint16_t)(make_seg(c->pc)>>16)); c->pc=t; prof_call(c); break; } /* CALR disp8 */
+        case BranchCALR12: { int32_t raw=op&0x0FFF; if (raw&0x0800) raw|=~0x0FFF; uint32_t t=rel_pc(c,-raw*2); push_word(c,(uint16_t)c->pc); if (SEG(c)) push_word(c,(uint16_t)(make_seg(c->pc)>>16)); c->pc=t; prof_call(c); break; } /* CALR disp12 (sign-extended, branches backward: −raw×2) */
         case BranchDJNZ: {
             /* DJNZ/DBJNZ: decrement reg (word if bit7 set, else byte), and if
              * still non-zero branch BACKWARD by the 7-bit unsigned disp (×2). */
@@ -398,6 +407,7 @@ static void exec_branch(CPU *c, const CtrlWord *w){
              * words (segment high word first, then offset) and rebuilds the EA. */
             uint8_t cc=nib3(op);
             if (!cond_true(c,cc)) break;
+            prof_ret(c);
             if (SEG(c)) { uint16_t hi=pop_word(c); uint16_t lo=pop_word(c); c->pc=seg_addr(((uint32_t)hi<<16)|lo); }
             else c->pc=(c->pc&0x7F0000u)|pop_word(c);   /* nonseg: stay in PC's segment */
             break;
@@ -558,6 +568,7 @@ static void exec_shift(CPU *c, const CtrlWord *w){
                   : (w->width==WByte) ? (int8_t)c->opcode[1] : (int16_t)c->opcode[1];
     AluOp op=w->alu_op; int n=count;
     if (count<0) { op = (w->alu_op==OpSla)?OpSra:OpSrl; n=-count; }  /* negative count → shift the other way */
+    c->cyc += (w->count==SrcReg ? 9 : 7) + 3u*(unsigned)(n & 0x3F);
     uint64_t val; switch (w->width){ case WByte: val=rb(c,dst); break; case WLong: val=rl(c,dst); break; default: val=rw(c,dst);}
     AluResult r=alu_exec(op, val, (uint64_t)n, false, w->width);
     switch (w->width){ case WByte: wb(c,dst,(uint8_t)r.value); break; case WLong: wl(c,dst,(uint32_t)r.value); break; default: ww(c,dst,(uint16_t)r.value);}
@@ -589,6 +600,7 @@ static void exec_ldm(CPU *c, const CtrlWord *w){
  * ops the data lane depends on spec (see io_read/io_write). */
 static void exec_io(CPU *c, const CtrlWord *w){
     if (!check_priv(c)) return;
+    c->cyc += cyc_io; c->nio++;
     uint16_t op=c->opcode[0]; uint32_t port; uint8_t dr;
     switch (w->src2){
         case SrcIR: port=rw(c,nib2(op)); dr=nib3(op); break;
@@ -776,6 +788,7 @@ static void exec_block_string(CPU *c, const CtrlWord *w){
  * memory pointer by ±width and decrementing count. PV set when count hits 0. */
 static void exec_block_io(CPU *c, const CtrlWord *w){
     if (!check_priv(c)) return;
+    c->cyc += cyc_io; c->nio++;
     uint16_t ew=c->opcode[1];
     uint8_t cntReg=(ew>>8)&0x0F;
     /* Register roles are swapped between input and output:
@@ -905,7 +918,7 @@ static void execute(CPU *c, const CtrlWord *w){
         case ClsDiv: exec_div(c,w); break;
         case ClsLDPS: exec_ldps(c,w); break;
         case ClsHalt: if (check_priv(c)) c->halted=true; break;          /* HALT: privileged; wait for interrupt */
-        case ClsSysCall: c->irq_req|=IRQ_SYSCALL; break;                 /* SC: request a system-call trap */
+        case ClsSysCall: c->irq_req|=IRQ_SYSCALL; prof_sc(c); break;                 /* SC: request a system-call trap */
         case ClsIRET: exec_iret(c); break;
         case ClsTranslate: exec_translate(c,w); break;
     }
@@ -948,6 +961,7 @@ static bool handle_interrupts(CPU *c){
     if (c->vi_line && (c->fcw & FCW_VIE)) c->irq_req |= IRQ_VI;
 
     if (c->irq_req==0) return false;
+    c->cyc += 20;
 
     /* Select the highest-priority pending source. intack_kind marks the
      * external kinds (1=SEGT,2=NMI,3=NVI,4=VI); internal traps set internal. */
@@ -1079,6 +1093,52 @@ static void tring_dump(FILE *f, unsigned max_normal){
     }
 }
 
+
+/* Cycles an instruction takes beyond its bus cycles (3 a memory word, 4 an
+ * I/O access), after the Z8001 segmented-mode timings. */
+static unsigned cyc_extra(const CtrlWord *w){
+    switch (w->exec){
+    case ClsUnified: {
+        unsigned e = 1;
+        if (dst_is_mem(w->dst)) e++;
+        if (w->src2==SrcBased || w->src2==SrcBX || w->dst==DstBased || w->dst==DstBX) e += 4;
+        if (w->src2==SrcX || w->dst==DstX) e++;
+        return e;
+    }
+    case ClsFcwOp: case ClsLDCTL: return 4;
+    case ClsStack:
+        return (w->stk_mode==StackPop || w->stk_mode==StackPopDst) ? 2 : 3;
+    case ClsBranch:
+        switch (w->br_mode){
+        case BranchJP_DA: return 1;
+        case BranchJP_X: return 2;
+        case BranchJP_IR: return 5;
+        case BranchJR: return 3;
+        case BranchCALL_DA: case BranchCALL_X: return 7;
+        case BranchCALL_IR: case BranchCALR: case BranchCALR12: return 6;
+        case BranchRET: return 4;
+        case BranchDJNZ: return 8;
+        }
+        return 2;
+    case ClsExts: return 8;
+    case ClsTCC: case ClsDAB: return 2;
+    case ClsExchange: case ClsBCDRotate: return 3;
+    case ClsBitDynamic: return 7;
+    case ClsLEA: return 4;
+    case ClsIO: return 3;
+    case ClsShift: return 0;
+    case ClsBlockTransfer: case ClsBlockIO: return 5;
+    case ClsBlockCompare: case ClsBlockString: case ClsTranslate: return 8;
+    case ClsLDM: return 5;
+    case ClsMul: return w->width==WLong ? 275 : 65;
+    case ClsDiv: return w->width==WLong ? 735 : 100;
+    case ClsLDPS: return 10;
+    case ClsSysCall: return 15;
+    case ClsIRET: return 4;
+    default: return 5;
+    }
+}
+
 void cpu_step(CPU *c){
     c->serviced = 0;
     /* service pending traps/interrupts at instruction boundary */
@@ -1136,6 +1196,7 @@ void cpu_step(CPU *c){
     uint32_t pc_next = addr_add(c->instr_start, (uint32_t)need*2);
     c->pc = pc_next;
 
+    c->cyc += cyc_mem*(unsigned)need + cyc_extra(w);
     execute(c, w);
     c->insns++;
     /* Debug: CSIM_BREAK_INSNS=N — dump registers + trace ring when the
@@ -1202,6 +1263,7 @@ void cpu_step(CPU *c){
             c->pc = c->instr_start;
             return;
         }
+        c->cyc += cyc_mem;
         execute(c, w);
         c->insns++;
         /* Write warning inside a block op: raise the trap; the loop-head check
