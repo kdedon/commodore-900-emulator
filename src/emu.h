@@ -305,6 +305,7 @@ typedef struct {
     uint32_t sectors;    /* total 512-byte sectors */
     uint32_t cyls, heads, spt;
     bool     present;
+    bool     geom;       /* cyls/heads/spt given: sectors sit by them */
 } Disk;
 
 /* Commodore floppy: 80 tracks × 2 sides, zone-bit density (16/15/14/13
@@ -387,6 +388,11 @@ struct Machine {
     bool    rx_overrun_on;
 
     Disk disk;           /* hard disk, command block at hdc_cmdblk */
+    Disk disk1;          /* optional second hard disk (LUN bit 5) */
+    /* The card's one WDSDP set, shared by both hard disks. */
+    bool     sdp_set;
+    uint32_t sdp_cyls, sdp_heads, sdp_spt;
+    unsigned long sdp_count;
     Disk floppy;         /* optional floppy, command block at hdc_cmdblk+0x10 */
 
     /* PDMAC DMA address latch (23-bit) for HDC */
@@ -561,6 +567,8 @@ void    lc_screen_text(const Machine *m, char *buf);
 void    lc_screen_dump(const Machine *m, FILE *out);
 bool    lc_bitmap_dump(const Machine *m, FILE *out);
 int  machine_attach_disk(Machine *m, const char *path);
+int  machine_attach_disk1(Machine *m, const char *path);
+int  disk_set_geom(Disk *d, const char *chs);
 int  machine_attach_floppy(Machine *m, const char *path);
 void machine_run(Machine *m);
 

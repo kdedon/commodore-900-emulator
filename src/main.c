@@ -693,6 +693,10 @@ static void usage(FILE *out, const char *prog){
         "Usage: %s [options]\n"
         "  --firmware=DIR   ROM directory with bios_h.bin + bios_l.bin (default ../rom)\n"
         "  --disk=FILE      raw hard-disk image (default ../disk/hdd.bin; required)\n"
+        "  --disk1=FILE     second hard-disk image (optional)\n"
+        "  --disk-geom=C,H,S, --disk1-geom=C,H,S\n"
+        "                   a drive's own geometry: sectors sit by it, and the\n"
+        "                   card's one WDSDP set must match it (default: flat)\n"
         "  --floppy=FILE    raw floppy image for the floppy drive (optional)\n"
         "  --trace          print periodic PC/FCW progress to stderr\n"
         "  --max=N          stop after N instructions (0 = run until Ctrl-])\n"
@@ -918,6 +922,7 @@ int main(int argc, char **argv){
     /* --- argument parsing (see usage() for the full option list) ------------
      * Value options accept both "--opt=VALUE" and "--opt VALUE". */
     const char *fw = "../rom", *disk = "../disk/hdd.bin", *floppy = NULL, *g_input = NULL;
+    const char *disk1 = NULL, *geom0 = NULL, *geom1 = NULL;
     const char *rtcseed = "host", *wire = NULL, *g_inmark = NULL;
     const char *wireN[SCC_PORTS] = {0};   /* --wire1 .. --wire5, by port number */
     bool lr_scc = false, rx_overrun = false, hr_board = false, lc_card = false, lc_slots = false;
@@ -948,6 +953,9 @@ int main(int argc, char **argv){
         else if ((v = opt_value(argv,argc,&i,"--rtc")))     rtcseed = v;
         else if ((v = opt_value(argv,argc,&i,"--firmware"))) fw = v;
         else if ((v = opt_value(argv,argc,&i,"--disk")))     disk = v;
+        else if ((v = opt_value(argv,argc,&i,"--disk1")))    disk1 = v;
+        else if ((v = opt_value(argv,argc,&i,"--disk-geom")))  geom0 = v;
+        else if ((v = opt_value(argv,argc,&i,"--disk1-geom"))) geom1 = v;
         else if ((v = opt_value(argv,argc,&i,"--floppy")))   floppy = v;
         else if ((v = opt_value(argv,argc,&i,"--max")))      g_max = strtoull(v,0,0);
         else if ((v = opt_value(argv,argc,&i,"--input-mark"))) g_inmark = v;
@@ -1025,6 +1033,15 @@ int main(int argc, char **argv){
     }
     if (machine_attach_disk(m, disk) != 0) {
         fprintf(stderr,"failed to open hard-disk image %s (the machine requires a hard disk)\n", disk);
+        return 1;
+    }
+    if (disk1 && machine_attach_disk1(m, disk1) != 0) {
+        fprintf(stderr,"failed to open hard-disk image %s\n", disk1);
+        return 1;
+    }
+    if ((geom0 && disk_set_geom(&m->disk, geom0) != 0) ||
+        (geom1 && disk_set_geom(&m->disk1, geom1) != 0)) {
+        fprintf(stderr,"bad --disk-geom/--disk1-geom: want C,H,S\n");
         return 1;
     }
     if (floppy && machine_attach_floppy(m, floppy) != 0) {
@@ -1177,6 +1194,8 @@ int main(int argc, char **argv){
      * died" (the CP/M suite's EMUOK does) must not see one for a run that
      * finished its work.  rtc_report() stays the LAST line on stderr; the
      * verify-rtc targets read it with tail -1. */
+    if (m->sdp_count)
+        fprintf(stderr,"\n[hdc: %lu WDSDP]", m->sdp_count);
     fprintf(stderr,"\n[c900: stopped after %llu instructions%s%s]\n",
             (unsigned long long)m->cpu.insns,
             m->stop_why ? " -- " : "", m->stop_why ? m->stop_why : "");

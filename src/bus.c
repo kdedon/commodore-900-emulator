@@ -479,6 +479,38 @@ void scc_rx_port(Machine *m, int port, uint8_t b){
  * byte (offset 0x0C) holds 0xFF; the controller overwrites it with a completion
  * status and raises the interrupt. Both media address their data by linear
  * block number, so this is a flat-file seek/copy for either one. */
+/* The file sector holding the card's LBA on a disk with its own geometry, or
+ * -1 for ID not found.  The card splits the LBA by its WDSDP set alone. */
+static long hdc_map(Machine *m, Disk *d, uint32_t lba){
+    if (!d->geom || !m->sdp_set) return lba;
+    if (m->sdp_spt == 0 || m->sdp_heads == 0) return -1;
+    uint32_t sec = lba % m->sdp_spt, t = lba / m->sdp_spt;
+    uint32_t head = t % m->sdp_heads, cyl = t / m->sdp_heads;
+    if (cyl >= m->sdp_cyls) return -1;
+    if (cyl >= d->cyls || head >= d->heads || sec >= d->spt) return -1;
+    return ((long)cyl * d->heads + head) * d->spt + sec;
+}
+
+/* Read or write bcnt sectors one by one through hdc_map(). */
+static uint8_t hdc_geom_xfer(Machine *m, Disk *d, uint32_t lba, uint32_t bcnt,
+                             uint32_t dma, bool wr){
+    uint8_t buf[512];
+    for (uint32_t s = 0; s < bcnt; s++){
+        long p = hdc_map(m, d, lba + s);
+        if (p < 0 || (uint32_t)p >= d->sectors) return 0x95;
+        fseek(d->fp, p * 512, SEEK_SET);
+        if (wr){
+            for (int i=0;i<512;i++) buf[i] = phys_read8(m, dma + s*512 + i);
+            fwrite(buf,1,512,d->fp);
+        } else {
+            if (fread(buf,1,512,d->fp) != 512) memset(buf,0,512);
+            for (int i=0;i<512;i++) phys_write8(m, dma + s*512 + i, buf[i]);
+        }
+    }
+    if (wr) fflush(d->fp);
+    return 0x80;
+}
+
 static void hdc_process(Machine *m, uint32_t cb, Disk *disk, bool is_floppy){
     if (phys_read8(m, cb + 0x0C) != 0xFF) return;    /* not armed for this block */
     uint8_t opcode = phys_read8(m, cb + 0x00);
@@ -491,11 +523,26 @@ static void hdc_process(Machine *m, uint32_t cb, Disk *disk, bool is_floppy){
                     ((uint32_t)phys_read8(m, cb+0x07)<<8)  |
                      (uint32_t)phys_read8(m, cb+0x08);
     uint32_t lba  = ((uint32_t)(lunhi & 0x1F)<<16) | ((uint32_t)mid<<8) | low;
+    if (!is_floppy && (lunhi & 0x20)) disk = &m->disk1;
 
     uint8_t status;
     switch (opcode){
+        case 0x0C: /* SetDriveParams: one set for the card, drive bit ignored */
+            if (disk->present) {
+                uint8_t hc = phys_read8(m, dma + 1);
+                m->sdp_set = true;
+                m->sdp_heads = hc >> 4;
+                m->sdp_cyls = ((uint32_t)(hc & 0x0F) << 8) | phys_read8(m, dma + 2);
+                m->sdp_spt = phys_read8(m, dma + 5);
+                m->sdp_count++;
+                if (getenv("C900_HDC_TRACE"))
+                    fprintf(stderr, "[hdc] WDSDP #%lu lun=%d %u cyl x %u heads x %u spt\n",
+                            m->sdp_count, (lunhi >> 5) & 1, m->sdp_cyls,
+                            m->sdp_heads, m->sdp_spt);
+            }
+            status = disk->present ? 0x00 : 0x92;
+            break;
         case 0x00: /* TestDriveReady */
-        case 0x0C: /* SetDriveParams */
         case 0x01: /* Restore */
         case 0x05: /* CheckTrackFormat */
         case 0x03: /* RequestStatus */
@@ -511,6 +558,7 @@ static void hdc_process(Machine *m, uint32_t cb, Disk *disk, bool is_floppy){
             break;
         case 0x08: /* Read */ {
             if (!disk->present)              { status = 0x92; break; }
+            if (disk->geom) { status = hdc_geom_xfer(m, disk, lba, bcnt, dma, false); break; }
             if (lba + bcnt > disk->sectors)  { status = 0x92; break; }
             uint32_t n = (uint32_t)bcnt * 512;
             fseek(disk->fp, (long)lba * 512, SEEK_SET);
@@ -535,6 +583,7 @@ static void hdc_process(Machine *m, uint32_t cb, Disk *disk, bool is_floppy){
             break; }
         case 0x0A: /* Write */ {
             if (!disk->present)              { status = 0x92; break; }
+            if (disk->geom) { status = hdc_geom_xfer(m, disk, lba, bcnt, dma, true); break; }
             if (lba + bcnt > disk->sectors)  { status = 0x92; break; }
             uint32_t n = (uint32_t)bcnt * 512;
             fseek(disk->fp, (long)lba * 512, SEEK_SET);
@@ -1108,6 +1157,27 @@ int machine_attach_disk(Machine *m, const char *path){
     /* MiniScribe 20MB geometry (612×4×17) — matches the shipped images */
     m->disk.cyls = 612; m->disk.heads = 4; m->disk.spt = 17;
     m->disk.present = true;
+    return 0;
+}
+
+int machine_attach_disk1(Machine *m, const char *path){
+    FILE *f = fopen(path, "r+b");
+    if (!f) f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    m->disk1.fp = f;
+    m->disk1.sectors = (uint32_t)(sz / 512);
+    m->disk1.present = true;
+    return 0;
+}
+
+/* "C,H,S": the drive's own geometry. */
+int disk_set_geom(Disk *d, const char *chs){
+    unsigned c, h, s;
+    if (sscanf(chs, "%u,%u,%u", &c, &h, &s) != 3 || !c || !h || !s) return -1;
+    d->cyls = c; d->heads = h; d->spt = s; d->geom = true;
     return 0;
 }
 
