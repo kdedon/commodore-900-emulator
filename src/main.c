@@ -351,6 +351,59 @@ static int mem_map_selftest(void){
     return ok;
 }
 
+/* ── static and dynamic shifts (run by --selftest) ──────────────────────────
+ * Each case runs one shift on preset registers.  A static byte shift takes
+ * its count from the low byte of the second word, so 00FF and FFFF both
+ * shift right by one; word and long forms use the whole word. */
+static int shift_selftest(void){
+    /* dst is the word register holding the operand (the pair's first for a
+     * long); r2 is the count register of the dynamic forms. */
+    static const struct { uint16_t op, cnt; int dst; uint32_t init; uint16_t r2; uint32_t want; uint16_t fl; const char *what; } t[] = {
+        { 0xB281, 0x00FF, 0, 0x00F8, 0, 0x007C, 0, "srlb rl0,$1" },
+        { 0xB281, 0x00FF, 0, 0x0081, 0, 0x0040, F_C, "srlb rl0,$1 (carry)" },
+        { 0xB281, 0xFFFF, 0, 0x0081, 0, 0x0040, F_C, "srlb rl0,$1 as FFFF" },
+        { 0xB281, 0x0004, 0, 0x0018, 0, 0x0080, F_C|F_S, "sllb rl0,$4" },
+        { 0xB281, 0x0008, 0, 0x00FF, 0, 0x0000, F_C|F_Z, "sllb rl0,$8" },
+        { 0xB219, 0x00FE, 1, 0x3B00, 0, 0x0E00, F_C, "srab rh1,$2" },
+        { 0xB299, 0x0002, 1, 0x0001, 0, 0x0004, 0, "slab rl1,$2" },
+        { 0xB289, 0x0001, 0, 0x0040, 0, 0x0080, F_S|F_PV, "slab rl0,$1 (overflow)" },
+        { 0xB289, 0x0007, 0, 0x0001, 0, 0x0080, F_S|F_PV, "slab rl0,$7" },
+        { 0xB289, 0x00FF, 0, 0x0081, 0, 0x00C0, F_C|F_S, "srab rl0,$1" },
+        { 0xB289, 0x00F9, 0, 0x0080, 0, 0x00FF, F_S, "srab rl0,$7" },
+        { 0xB2C1, 0x00FC, 4, 0x00A5, 0, 0x000A, 0, "srlb rl4,$4" },
+        { 0xB2C1, 0xFFFC, 4, 0x00A5, 0, 0x000A, 0, "srlb rl4,$4 as FFFC" },
+        { 0xB2C1, 0x00F8, 4, 0x00A5, 0, 0x0000, F_C|F_Z, "srlb rl4,$8" },
+        { 0xB283, 0x0200, 0, 0x0081, 0xFFFF, 0x0040, F_C, "sdlb rl0,r2 (-1)" },
+        { 0xB28B, 0x0200, 0, 0x0040, 0x0001, 0x0080, F_S|F_PV, "sdab rl0,r2 (+1)" },
+        { 0xB311, 0xFFFA, 1, 0x1111, 0, 0x0044, 0, "srl r1,$6" },
+        { 0xB311, 0x0004, 1, 0x1111, 0, 0x1110, F_C, "sll r1,$4" },
+        { 0xB36D, 0xFFFD, 6, 0x80000010, 0, 0xF0000002, F_S, "sral rr6,$3" },
+        { 0xB365, 0x0010, 6, 0x12355678, 0, 0x56780000, F_C, "slll rr6,$16" },
+    };
+    int ok = 1;
+    Machine *m = machine_new();
+    CPU *c = &m->cpu;
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
+        m->ram[0x080000] = (uint8_t)(t[i].op >> 8);  m->ram[0x080001] = (uint8_t)t[i].op;
+        m->ram[0x080002] = (uint8_t)(t[i].cnt >> 8); m->ram[0x080003] = (uint8_t)t[i].cnt;
+        memset(c->R, 0, sizeof c->R);
+        c->R[t[i].dst] = (uint16_t)t[i].init; c->R[2] = t[i].r2;
+        if ((t[i].op & 0xFF04) == 0xB304) { c->R[t[i].dst] = (uint16_t)(t[i].init >> 16); c->R[t[i].dst+1] = (uint16_t)t[i].init; }
+        c->fcw = FCW_SEG | FCW_SN; c->pc = 0x080000; c->halted = false; c->irq_req = 0;
+        cpu_step(c);
+        uint32_t got = ((t[i].op & 0xFF04) == 0xB304) ? (uint32_t)c->R[t[i].dst] << 16 | c->R[t[i].dst+1] : c->R[t[i].dst];
+        uint16_t fl = c->fcw & (F_C | F_Z | F_S | F_PV);
+        if (got != t[i].want || fl != t[i].fl) {
+            printf("shift FAIL: %s gave %X flags %02X, expected %X flags %02X\n",
+                   t[i].what, (unsigned)got, fl, (unsigned)t[i].want, t[i].fl);
+            ok = 0;
+        }
+    }
+    if (ok) printf("shifts PASSED (%d cases)\n", (int)(sizeof t / sizeof t[0]));
+    free(m->ram); free(m);
+    return ok;
+}
+
 static int selftest(void){
     Machine *m = machine_new();
     CPU *c = &m->cpu;
@@ -433,6 +486,9 @@ static int selftest(void){
 
     /* What answers the bus: fitted RAM and the video apertures. */
     if (!mem_map_selftest()) ok = 0;
+
+    /* Shift counts, byte forms in particular. */
+    if (!shift_selftest()) ok = 0;
 
     free(m->ram); free(m);
     return ok ? 0 : 1;

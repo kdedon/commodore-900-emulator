@@ -546,14 +546,16 @@ static void exec_div(CPU *c, const CtrlWord *w){
 
 /* ── shift ── SLA/SRA/SLL/SRL and dynamic (SDA/SDL) forms.
  * dst = nib2(opcode[0]) (long forces even alignment). The shift count comes
- * from opcode[1]: static (SrcImm) uses the whole signed word; dynamic (SrcReg)
- * reads it from the register named in opcode[1] bits 11:8. A NEGATIVE count
+ * from opcode[1]: static (SrcImm) uses the whole signed word, or only the low
+ * byte for byte forms; dynamic (SrcReg) reads it from the register named in
+ * opcode[1] bits 11:8. A NEGATIVE count
  * reverses direction (arithmetic SLA→SRA, logical SLL→SRL) using |count|.
  * Flags come from the ALU (no carry-in). */
 static void exec_shift(CPU *c, const CtrlWord *w){
     uint8_t dst=nib2(c->opcode[0]);
     if (w->width==WLong) dst&=0x0E;
-    int16_t count = (w->count==SrcReg) ? (int16_t)rw(c,(c->opcode[1]>>8)&0x0F) : (int16_t)c->opcode[1];
+    int16_t count = (w->count==SrcReg) ? (int16_t)rw(c,(c->opcode[1]>>8)&0x0F)
+                  : (w->width==WByte) ? (int8_t)c->opcode[1] : (int16_t)c->opcode[1];
     AluOp op=w->alu_op; int n=count;
     if (count<0) { op = (w->alu_op==OpSla)?OpSra:OpSrl; n=-count; }  /* negative count → shift the other way */
     uint64_t val; switch (w->width){ case WByte: val=rb(c,dst); break; case WLong: val=rl(c,dst); break; default: val=rw(c,dst);}
