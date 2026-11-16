@@ -344,7 +344,19 @@ static int mem_map_selftest(void){
     h->hr_board = true;
     phys_write16(h, 0x3E0000, 0xAAAA);
     if (phys_read16(h, 0x3E0000) != 0xAAAA) MFAIL("the HR bitmap does not answer\n");
-    if (ok) printf("memory map PASSED (fitted range, mirrored text RAM, HR bitmap)\n");
+
+    /* Its mouse block: the strap at 404H with or without a mouse. */
+    h->hr_strap = 2;
+    if (io_read(h, 0x0404, false, false) != 2) MFAIL("404H does not read the mono strap\n");
+    if (io_read(h, 0x0406, false, false) != 0) MFAIL("406H strap bits are not 00\n");
+    h->hr_strap = 1;
+    if (io_read(h, 0x0404, false, false) != 1) MFAIL("404H does not read the colour strap\n");
+    h->mouse_on = true; h->mouse_x = 0x2B7; h->mouse_y = 0x155; h->mouse_btn = 5;
+    if (io_read(h, 0x0400, false, false) != 0xA2B7) MFAIL("400H is not X and buttons\n");
+    if (io_read(h, 0x0402, false, false) != 0xA155) MFAIL("402H is not Y and buttons\n");
+    if (io_read(h, 0x0404, false, false) != 0xA2B5) MFAIL("404H is not X with the strap\n");
+    if (io_read(h, 0x0406, false, false) != 0xA154) MFAIL("406H is not Y with 00\n");
+    if (ok) printf("memory map PASSED (fitted range, mirrored text RAM, HR bitmap, HR mouse block)\n");
     #undef MFAIL
     free(h->ram); free(h);
     free(m->ram); free(m);
@@ -803,6 +815,8 @@ static void usage(FILE *out, const char *prog){
         "  --hr             fit the HR board, whose bitmap answers at segments\n"
         "                   3E-3F.  3F answers either way: with no HR board it is\n"
         "                   the motherboard's stack RAM\n"
+        "  --hr-bitmap=FILE fit the HR board and write its 128 KB bitmap to FILE\n"
+        "                   as a 1024x1024 PBM when the run ends (a 1 bit is white)\n"
         "  --lc             fit the LC card: ID 0xC1 at port 0x01FF and an 8563\n"
         "                   VDC at 0x0181/0x0183 with 64 KB of RAM, no picture\n"
         "  --lc-slots[=N]   the LC card, with each RAM access timed by the chip's\n"
@@ -907,7 +921,7 @@ int main(int argc, char **argv){
     const char *rtcseed = "host", *wire = NULL, *g_inmark = NULL;
     const char *wireN[SCC_PORTS] = {0};   /* --wire1 .. --wire5, by port number */
     bool lr_scc = false, rx_overrun = false, hr_board = false, lc_card = false, lc_slots = false;
-    const char *lc_screen = NULL, *lc_bitmap = NULL;
+    const char *lc_screen = NULL, *lc_bitmap = NULL, *hr_bitmap = NULL;
     uint8_t ram_lo = 0x08, ram_hi = 0x17;   /* the 1 MB motherboard, as fitted */
     unsigned long long rtc_ips = 0, slots_ips = 1500000;
     bool trace = false, dosel = false, wtrace = false;
@@ -975,6 +989,7 @@ int main(int argc, char **argv){
             hwev[nhwev++] = e;
         }
         else if (!strcmp(argv[i],"--hr")) hr_board = true;
+        else if ((v = opt_value(argv,argc,&i,"--hr-bitmap"))) { hr_bitmap = v; hr_board = true; }
         else if ((v = opt_value(argv,argc,&i,"--lc-screen"))) { lc_screen = v; lc_card = true; }
         else if ((v = opt_value(argv,argc,&i,"--lc-bitmap"))) { lc_bitmap = v; lc_card = true; }
         else if (!strcmp(argv[i],"--lc")) lc_card = true;
@@ -1101,6 +1116,10 @@ int main(int argc, char **argv){
     m->lr_scc = lr_scc;
     m->ram_lo = ram_lo; m->ram_hi = ram_hi;
     m->hr_board = hr_board;
+    {   /* C900_HRCONF=1 fits the colour strap */
+        const char *e = getenv("C900_HRCONF");
+        m->hr_strap = e ? (uint8_t)(atoi(e) & 3) : 2;
+    }
     m->lc_card = lc_card;
     m->vdc.slots = lc_slots;
     m->vdc.slots_ips = slots_ips ? slots_ips : 1500000;
@@ -1130,6 +1149,19 @@ int main(int argc, char **argv){
         FILE *f = strcmp(lc_screen, "-") ? fopen(lc_screen, "w") : stdout;
         if (f) { lc_screen_dump(m, f); if (f != stdout) fclose(f); }
         else fprintf(stderr, "--lc-screen: cannot write %s\n", lc_screen);
+    }
+    if (hr_bitmap) {
+        FILE *f = strcmp(hr_bitmap, "-") ? fopen(hr_bitmap, "wb") : stdout;
+        if (!f) fprintf(stderr, "--hr-bitmap: cannot write %s\n", hr_bitmap);
+        else {
+            fprintf(f, "P4\n1024 1024\n");
+            for (uint32_t a = 0x3E0000; a < 0x400000; a += 2) {
+                uint16_t w = (uint16_t)~phys_read16(m, a);
+                putc(w >> 8, f);
+                putc(w & 0xFF, f);
+            }
+            if (f != stdout) fclose(f);
+        }
     }
     if (lc_bitmap) {
         FILE *f = strcmp(lc_bitmap, "-") ? fopen(lc_bitmap, "wb") : stdout;

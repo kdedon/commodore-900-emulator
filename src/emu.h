@@ -362,6 +362,7 @@ struct Machine {
     uint8_t *ram;        /* full 24-bit space for simplicity (16 MiB) */
     uint8_t  ram_lo, ram_hi;  /* fitted DRAM, inclusive segment numbers (--ram) */
     bool     hr_board;   /* the HR board's bitmap answers at 0x3E-0x3F (--hr) */
+    uint8_t  hr_strap;   /* its M/C strap, bits 1:0 of 404H: 2 mono, 1 colour */
     bool     lc_card;    /* the LC card answers at 0x0181/0x0183/0x01FF (--lc) */
     VDC      vdc;
 

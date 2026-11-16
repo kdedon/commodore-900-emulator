@@ -37,6 +37,8 @@ The command line accepts the following arguments. Value options may be written e
   into any video aperture that adjoins the fitted RAM and counts it as memory.
 - `--hr` — fit the HR board, whose bitmap answers at segments `3E-3F`. Segment `3F`
   answers either way: with no HR board it is the motherboard's stack RAM.
+- `--hr-bitmap=FILE` — fit the HR board and, when the run ends, write its 128 KB bitmap
+  to FILE as a 1024x1024 PBM (`-` for stdout). A set bit is a white pixel.
 - `--trace` — print periodic PC/FCW progress to stderr.
 - `--max=N` — stop after N instructions (0, the default, runs until Ctrl-]).
 - `--input="..."` — feed scripted console keystrokes, with `\r`, `\n`, `\t`, and `\\` escapes,

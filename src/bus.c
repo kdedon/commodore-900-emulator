@@ -892,14 +892,15 @@ uint16_t io_read(Machine *m, uint16_t port, bool is_byte, bool special){
             return (uint16_t)scc_read(m, chip, chan, reg) << 8;
         }
     }
-    /* C900_HRCONF=n: the HR board's 404H mode field reads n (1 = colour). */
-    if (m->hr_board && (port & 0xFFFE) == 0x0404) {
-        static int hrconf = -2;
-        if (hrconf == -2) {
-            const char *e = getenv("C900_HRCONF");
-            hrconf = e ? atoi(e) : -1;
-        }
-        if (hrconf >= 0) return (uint16_t)hrconf;
+    /* The HR board's mouse block, 0x0400-0x0407: X at A1 = 0, Y at A1 = 1,
+     * buttons in 15:13 of both.  With A2 high, bits 1:0 read the M/C strap
+     * on X (2 mono, 1 colour) and 00 on Y. */
+    if (m->hr_board && (port & 0xFFF8) == 0x0400) {
+        uint16_t w = 0;
+        if (m->mouse_on)
+            w = (uint16_t)(((port & 2) ? m->mouse_y : m->mouse_x) & 0x3FF) | (m->mouse_btn & 7) << 13;
+        if (port & 4) w = (uint16_t)((w & ~3) | ((port & 2) ? 0 : m->hr_strap));
+        return is_byte ? (uint16_t)(w & 0xFF00) : w;
     }
     if (m->mouse_on && (port & 0xFFFC) == 0x0400) {
         uint16_t w = (port & 2) ? (m->mouse_y & 0x3FF)
