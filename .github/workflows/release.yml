@@ -1,13 +1,11 @@
-# Build the emulator on Linux and Windows.  Every push and pull request builds
-# and runs the self-test; a v* tag also packages the binaries and publishes them
-# as release assets.
-name: build
+# release: on a v* tag, build and test on Linux and Windows and publish the
+# packages.  The asset names are what dependants' DEPS fetch:
+# c900-<tag>-linux-x86_64.tar.gz and c900-<tag>-windows-x86_64.zip.
+name: release
 
 on:
   push:
-    branches: [ main, master ]
     tags: [ 'v*' ]
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -21,7 +19,7 @@ jobs:
       - name: Build
         run: make
       - name: Self-test
-        run: ./bin/c900 --selftest
+        run: make test
       # The layout matches the documented defaults: c900 resolves --firmware to
       # ../rom and --disk to ../disk/hdd.bin, so running bin/c900 from inside the
       # unpacked directory boots with no arguments.  The ROM and disk are BSD-3
@@ -54,7 +52,7 @@ jobs:
       - name: Build
         run: make
       - name: Self-test
-        run: ./bin/c900.exe --selftest
+        run: make test
       - name: Package
         run: |
           name=c900-${GITHUB_REF_NAME}-windows-x86_64
