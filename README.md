@@ -7,14 +7,15 @@ Instruction-level Commodore 900 emulator, based on kevind's HDL Commodore 900 co
 It emulates only the bare minimum necessary for software cross-development on the host machine:
 
 * Z8001 CPU + Z8010 MMU
-* 1 MB RAM
-* 20 MB hard drive
+* 1 MB RAM by default (`--ram`)
+* Two hard drives (`--disk`, `--disk1`); the supplied image is 20 MB
 * Optional floppy drive (see `--floppy` below)
 * Both SCC serial channels: 
   - channel B (base 0x100, the guest's `/dev/tty50`) is the console and redirects to the host terminal
   - channel A (base 0x120, the guest's `/dev/tty51`) is the second RS-232 port and can be attached to a host socket with `--wire` (see below)
 
-No graphics card at present.
+Optional boards: the HR card's 1024x1024 bitmap and mouse (`--hr`), the LC card's 8563 VDC (`--lc`), and the LR board's two SCCs (`--lr-scc`).
+The keyboard and mouse take scripted input (`--key`, `--mouse`).
 
 ## Running
 
@@ -29,6 +30,8 @@ The command line accepts the following arguments. Value options may be written e
 
 - `--firmware=DIR` — directory holding the BIOS ROMs `bios_h.bin` and `bios_l.bin` (default `../rom`).
 - `--disk=FILE` — raw hard-disk image (default `../disk/hdd.bin`). A hard disk is mandatory; the emulator exits with an error if the image can't be opened.
+- `--disk1=FILE` — second hard-disk image (optional).
+- `--disk-geom=C,H,S`, `--disk1-geom=C,H,S` — a drive's own geometry. Sectors are placed by it, and the guest must program the card's one WDSDP set to match. The default is flat.
 - `--floppy=FILE` — raw floppy image, attached to the floppy drive (`/dev/fd1`). Optional; when omitted the floppy drive is empty. The image is a flat 512-byte-per-sector Coherent floppy (up to 2392 blocks); a short image has its trailing sectors read back as zeros.
 - `--ram=LO-HI` — fitted motherboard DRAM, as inclusive 64 KB segment numbers in hex
   (default `08-17`, the 1 MB board). The boot ROM sizes memory by writing a pattern at
@@ -36,9 +39,34 @@ The command line accepts the following arguments. Value options may be written e
   answer, so it reports whatever is fitted from there — and, as on hardware, it walks
   into any video aperture that adjoins the fitted RAM and counts it as memory.
 - `--hr` — fit the HR board, whose bitmap answers at segments `3E-3F`. Segment `3F`
-  answers either way: with no HR board it is the motherboard's stack RAM.
+  answers either way: with no HR board it is the motherboard's stack RAM. Its mouse
+  block answers at `0x0400-0x0407`: X and Y counters, buttons in bits 15:13 of both,
+  and the mono/colour strap in bits 1:0 of `0x0404` (2 mono, 1 colour).
 - `--hr-bitmap=FILE` — fit the HR board and, when the run ends, write its 128 KB bitmap
   to FILE as a 1024x1024 PBM (`-` for stdout). A set bit is a white pixel.
+- `--lc` — fit the LC card: ID `0xC1` at port `0x01FF` and an 8563 VDC at
+  `0x0181/0x0183` with 64 KB of RAM. With the LC card fitted the mouse ports read all ones.
+- `--lc-slots[=N]` — the LC card, with each VDC RAM access timed by the chip's free
+  cycles. N is the CPU's instructions per second (default 1500000); `C900_CPU_HZ`
+  times it by modelled cycles instead.
+- `--lc-screen=FILE` — fit the LC card and write its 80x25 text screen to FILE when
+  the run ends (`-` for stdout).
+- `--lc-bitmap=FILE` — fit the LC card and write its bitmap-mode picture to FILE when
+  the run ends: PBM, or RGBI PPM when attributes are on (`-` for stdout).
+- `--key=T:HH` — press keyboard scancode HH (hex; bit 7 is release) T loop ticks after
+  `--hw-mark`, once the previous key has been taken. Repeatable.
+- `--mouse=T:DX:DY[:B]` — at tick T, move the mouse counters by DX,DY and set buttons B.
+  Without `--hr` the counters answer at `0x0400/0x0402`. Repeatable.
+- `--hw-mark=TEXT` — console text that starts the `--key`/`--mouse` clock (default: the
+  start of the run).
+- `--lr-scc` — fit the LR board's two SCCs (ports 2-5) with no wire attached.
+- `--wireN=PATH` — attach serial port N (1-5) to an AF_UNIX socket, as `--wire` does for
+  port 1. Ports 2-5 fit the LR board.
+- `--rx-overrun` — let a receiver lose a byte that arrives before the guest read the
+  last one, latching Rx Overrun as the SCC does.
+- `--rtc=WHEN` — seed the clock: `host` (default), `none` for no module, or
+  `YYYY-MM-DDTHH:MM:SS`.
+- `--rtc-ips=N` — instructions per RTC second (default 1500000).
 - `--trace` — print periodic PC/FCW progress to stderr.
 - `--max=N` — stop after N instructions (0, the default, runs until Ctrl-]).
 - `--input="..."` — feed scripted console keystrokes, with `\r`, `\n`, `\t`, and `\\` escapes,
@@ -58,12 +86,13 @@ The command line accepts the following arguments. Value options may be written e
   guest OS needs to run SLIP between them.
 - `--break=SEG:OFF[/N]` — record the CPU state at a guest PC. See "Breakpoints and memory dumps" below.
 - `--dump=SPEC` — record a window of guest memory, at every breakpoint hit and once at the end of the run. See "Breakpoints and memory dumps" below.
-- `--stop-on=LIST` — which early-stop channels are armed: `idle`, `port`, `break`, `all` (the default), or `none` to run to `--max` whatever happens. See "Stopping a scripted run" below.
+- `--stop-on=LIST` — which early-stop channels are armed: `idle`, `port`, `park`, `break`, `mark`, `all` or `none` (default `port,park`). See "Stopping a scripted run" below.
 - `--idle=N` — instructions of console silence the `idle` channel waits for (default 40000000).
 - `--stop-port=P` — the `port` channel's I/O port (default `0x0FFE`).
+- `--stop-mark=TEXT` — end the run when the guest prints TEXT on any serial channel.
 - `--require-stop` — exit 3 if the run ended by exhausting `--max` rather than by stopping, so a caller can assert that the session *finished* rather than merely that the emulator survived.
 - `--wire-trace` — hexdump every byte crossing `--wire` to stderr.
-- `--selftest` — run the built-in CPU/ALU regression and exit (needs neither ROM nor disk).
+- `--selftest` — run the built-in regression and exit (needs neither ROM nor disk). `make test` runs it.
 - `--help`, `-h` — print the option list and exit.
 
 For example, to boot with a floppy image attached:
@@ -144,16 +173,17 @@ keys.
 
 ## Stopping a scripted run
 
-There are two channels that can stop a run early and `--stop-on` selects them:
-* `--stop-on=all` (the default) arms both
-* `--stop-on=none` restores the old behaviour exactly
-* `--stop-on=idle` The run ends when all
-three of these hold: the scripted input is exhausted, the last byte the guest
-transmitted on the console was a prompt character, and it has transmitted
-nothing for another 40M instructions.
-* `--stop-on=port` A word write of `0xC900` to an unmapped I/O port ends the run. 
-* `--stop-on=break` The run ends once a `--break` has recorded its last hit, with the
+`--stop-on` takes a comma-separated list of channels; the default is `port,park`:
+* `idle` The run ends when all three of these hold: the scripted input is exhausted,
+the last byte the guest transmitted on the console was a prompt character, and it has
+transmitted nothing for `--idle` instructions (default 40M).
+* `port` A word write of `0xC900` to `--stop-port` ends the run.
+* `park` The run ends when the guest is halted and does nothing when its periodic
+interrupt wakes it. A guest that sleeps longer than the watch's budget looks the same.
+* `break` The run ends once a `--break` has recorded its last hit, with the
 instruction at that PC not yet executed.
+* `mark` The run ends when the guest prints `--stop-mark`.
+* `all` arms every channel; `none` runs to `--max`.
 
 ## Breakpoints and memory dumps
 
@@ -265,9 +295,29 @@ run.  Guest faults — an illegal instruction, a privileged instruction, a
 segment trap — are reported with the instruction and its address, so a program
 that died is never confused with a host-side failure.
 
+## Profiling and measurement
+
+Environment variables, read at start-up:
+
+| Variable | Effect |
+|---|---|
+| `C900_PROF` | Profile. At each `C900_PROF_MARK` printed on the console, write `[prof]` lines to stderr and clear the counts: cycles (system, user, idle), system-mode cycles by PC, calls with inclusive cycles, call sites, system calls, deepest user stack, LC and HR bitmap traffic. |
+| `C900_PROF_MARK=TEXT` | Console text that ends each profile interval. |
+| `C900_PROF_PROC=ADDR` | Cycles by process. ADDR is the kernel's current-process pointer (segmented, hex). |
+| `C900_PROF_PID=OFF` | Offset of the pid in the process entry (default 100). |
+| `C900_PROF_UPID=PID` | User-mode cycles of that pid by PC. |
+| `C900_TICK_CYC=N` | Clock tick every N modelled cycles. |
+| `C900_HW_CYC` | Time `--key`/`--mouse` in modelled cycles instead of loop ticks. |
+| `C900_CPU_HZ=N` | CPU clock for `--lc-slots`. |
+| `C900_CYC_MEM=N`, `C900_CYC_IO=N` | Memory and I/O bus cycle costs (default 3 and 4). |
+| `C900_HR_WAIT=N` | Wait clocks added to each word access of the HR bitmap. |
+| `C900_HRCONF=N` | HR mono/colour strap (2 mono, the default; 1 colour). |
+| `C900_HRSNAP=PREFIX` | Write the HR bitmap to `PREFIX.N` at each profile mark. |
+| `C900_HRWATCH=x,y,w,h[,period][;...]` | Every period cycles (default 100000), append each changed HR bitmap rectangle (up to 4) to `C900_HRWATCH_OUT` (default `hrwatch.txt`). |
+
 ## Building
 
-To build the emulator, simply type `make`. gcc is used for compilation, but since the C files are straight C99, other compilers should work too.
+`make` builds `bin/c900`; `make test` also runs the self-test. The source is C99 with no dependencies; gcc is the default compiler (`make CC=clang`). Windows builds use MinGW-w64.
 
 ## Tools
 
