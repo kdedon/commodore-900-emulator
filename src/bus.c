@@ -316,6 +316,10 @@ static void scc_write(Machine *m, int chip, int chan, int addrReg, uint8_t v){
              * the longest prefix of the mark that is still matched, so a mark
              * whose own prefix repeats is found where it occurs -- see
              * mark_advance(). */
+            if (m->hw_mark && !m->hw_armed) {
+                m->hw_mark_pos = mark_advance(m->hw_mark, m->hw_mark_pos, v);
+                if (m->hw_mark[m->hw_mark_pos] == '\0') { m->hw_armed = true; m->hw_t0 = m->tick_counter; }
+            }
             if (m->inq_mark && !m->inq_mark_seen) {
                 m->inq_mark_pos = mark_advance(m->inq_mark, m->inq_mark_pos, v);
                 if (m->inq_mark[m->inq_mark_pos] == '\0') m->inq_mark_seen = true;
@@ -820,6 +824,30 @@ void rtc_report(Machine *m, FILE *out){
 }
 
 /* ─────────────── I/O dispatch ─────────────── */
+/* Deliver the scripted events now due.  A key waits until the driver has
+ * cleared the last one (DAV low); bit 7 of its code is the release. */
+static void hw_service(Machine *m){
+    if (!m->hw_armed) return;
+    while (m->hwev_next < m->nhwev) {
+        struct hwev *e = &m->hwev[m->hwev_next];
+        if (m->tick_counter - m->hw_t0 < e->at) return;
+        if (e->key >= 0) {
+            if (m->pa_irf) return;
+            m->pa_data = (uint8_t)((e->key & 0x7F) | 0x80);
+            m->pa_up = (e->key & 0x80) != 0;
+            m->pa_irf = true;
+            m->pa_ip = true;
+            fprintf(stderr, "[hw] key %02X at tick %llu\n", e->key, (unsigned long long)m->tick_counter);
+        } else {
+            m->mouse_x = (uint16_t)(m->mouse_x + e->dx);
+            m->mouse_y = (uint16_t)(m->mouse_y + e->dy);
+            m->mouse_btn = (uint8_t)e->btn;
+            fprintf(stderr, "[hw] mouse %+d %+d btn %d at tick %llu\n", e->dx, e->dy, e->btn, (unsigned long long)m->tick_counter);
+        }
+        m->hwev_next++;
+    }
+}
+
 uint16_t io_read(Machine *m, uint16_t port, bool is_byte, bool special){
     if (special) {
         uint8_t low = port & 0xFF;
@@ -844,12 +872,19 @@ uint16_t io_read(Machine *m, uint16_t port, bool is_byte, bool special){
             return (uint16_t)scc_read(m, chip, chan, reg) << 8;
         }
     }
+    if (m->mouse_on && (port & 0xFFFC) == 0x0400) {
+        uint16_t w = (port & 2) ? (m->mouse_y & 0x3FF)
+                                : (uint16_t)((m->mouse_x & 0x3FF) | (m->mouse_btn & 7) << 13);
+        return is_byte ? (uint16_t)(w & 0xFF00) : w;
+    }
     /* CIO #1 0x0000-0x007F — plain register file (read back what was written).
      * In reset all regs read 0 except MICR. */
     if ((port & 0xFF80) == 0x0000) {
         int reg = (port >> 1) & 0x3F;
         if (m->cio1_reset && reg != 0) return 0;
         uint8_t v = m->cio1[reg];
+        if (m->pa_irf && reg == 0x0D) v = m->pa_data;
+        if (m->pa_irf && reg == 0x0F) v = (uint8_t)((v & ~0x04) | (m->pa_up ? 0x04 : 0));
         /* Port B: the RTC module drives D0..D3 back at us during a READ. */
         if (reg == CIO_PBDATA) v = rtc_pb_read(m, v);
         return (uint16_t)v << 8;
@@ -884,6 +919,39 @@ void io_write(Machine *m, uint16_t port, uint16_t data, bool is_byte, bool speci
         uint8_t v = (uint8_t)(data >> 8);
         if (reg == 0x00) {                    /* MICR: bit0=reset */
             if (!(v & 0x01)) m->cio1_reset = false;
+        }
+        if (reg == 0x08) {                    /* Port A Command & Status */
+            /* The register keeps reading back what was written (the boot
+             * ROM's register test); the command field drives IP and IE. */
+            switch ((v >> 5) & 0x07){
+                case 1: m->pa_ip = false; m->pa_ius = false; break;
+                case 2: m->pa_ius = true; break;
+                case 3: m->pa_ius = false; break;
+                case 4: m->pa_ip = true; break;
+                case 5: m->pa_ip = false; break;
+                case 6: m->pa_ie = true; break;
+                case 7: m->pa_ie = false; break;
+            }
+        }
+        if (reg == 0x0A || reg == 0x0B) {     /* CT1, CT2 Command & Status */
+            int n = reg - 0x0A;
+            uint8_t cmd = (v >> 5) & 0x07, cs = m->cio1[reg];
+            if (cmd == 1 || cmd == 5) cs &= ~0x20;      /* clear IP */
+            else if (cmd == 4) cs |= 0x20;              /* set IP */
+            cs = (cs & ~0x04) | (v & 0x04);             /* GCB */
+            if ((v & 0x02) && (!m->ct12_running[n] || (m->cio1[0x1C + n] & 0x04))) {
+                m->ct12_running[n] = true;
+                m->ct12_accum[n] = 0;
+            }
+            m->cio1[reg] = cs;
+            return;
+        }
+        /* Port C data: PC3 Low (D7 its write mask) clears the keyboard
+         * byte and DAV. */
+        if (reg == 0x0F && !(v & 0x88)) m->pa_irf = false;
+        if (reg == 0x01) {                    /* MCCR: disabling a counter stops it */
+            if (!(v & 0x40)) m->ct12_running[0] = false;
+            if (!(v & 0x20)) m->ct12_running[1] = false;
         }
         if (reg == 0x0C) {                    /* CT3 Command & Status */
             /* Apply the command (D7:D5) to the IP/IE/IUS bits rather than
@@ -1315,10 +1383,27 @@ void machine_run(Machine *m){
             if (++m->ct3_accum >= period) { m->ct3_accum = 0; m->cio1[0x0C] |= 0x20; m->ct3_ticks++; } /* set IP */
         }
 
+        /* CT1 and CT2 on the same instruction-scaled clock as CT3. */
+        for (int n = 0; n < 2; n++) {
+            if (!m->ct12_running[n] || !(m->cio1[0x0A + n] & 0x04)) continue;
+            uint32_t tc = ((uint32_t)m->cio1[0x16 + 2*n]<<8) | m->cio1[0x17 + 2*n];
+            uint32_t period = tc>>1; if (period<2000) period=2000; if (period>60000) period=60000;
+            if (++m->ct12_accum[n] >= period) {
+                m->ct12_accum[n] = 0;
+                m->cio1[0x0A + n] |= 0x20;
+                if (!(m->cio1[0x1C + n] & 0x80)) m->ct12_running[n] = false;   /* single cycle */
+            }
+        }
+
         /* Vectored-interrupt aggregation, in daisy-chain priority order:
          * CIO #1 (CT3 timer) outranks the PDMAC disk completion. */
         bool ct3_int = (m->cio1[0x0C] & 0x20) && (m->cio1[0x0C] & 0x40)   /* CT3 IP & IE */
                     && (m->cio1[0x00] & 0x80);                            /* MICR MIE */
+        if (m->nhwev && (m->tick_counter & 0xFF) == 0) hw_service(m);
+        /* Port A asks again only once its handler has cleared IUS: Coherent
+         * echoes the key with interrupts on before it clears IP. */
+        bool pa_int = m->nhwev && m->pa_ip && m->pa_ie && !m->pa_ius && (m->cio1[0x00] & 0x80)
+                    && (m->cio1[0x01] & 0x04);                            /* Port A IP&IE, MIE, PAE */
         /* Within the SCC, channel A outranks channel B (chip-internal daisy
          * chain), so a busy wire is serviced ahead of a console keystroke. */
         bool scc_a_int = scc_rxa_int(m);                                  /* Ch A Rx available */
@@ -1327,6 +1412,8 @@ void machine_run(Machine *m){
             uint8_t vec = m->cio1[0x04];                                  /* CTIV */
             if (m->cio1[0x00] & 0x04) vec &= ~0x07u;                      /* CTVIS: CT3 → ctNum 0 */
             c->vi_line = true; c->vi_vector = vec; m->last_vi_disk = false;
+        } else if (pa_int) {
+            c->vi_line = true; c->vi_vector = m->cio1[0x02]; m->last_vi_disk = false; m->last_vi_pa = true;
         } else if (scc_a_int) {
             c->vi_line = true; c->vi_vector = scc_vector_src(m, 0x06); m->last_vi_disk = false;
         } else if (scc_int) {
@@ -1349,6 +1436,8 @@ void machine_run(Machine *m){
         /* The disk VI is a one-shot (cleared when serviced); the CT3 IP is
          * level and is cleared by the clock ISR writing the CS register. */
         if (c->serviced == IRQ_VI && m->last_vi_disk) m->disk_vi = false;
+        if (c->serviced == IRQ_VI && m->last_vi_pa) m->pa_ius = true;
+        m->last_vi_pa = false;
 
         if (c->halted && !c->vi_line && !m->disk_vi) {
             if (++idle > 2000000) {          /* stuck halted with no wakeup */

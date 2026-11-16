@@ -391,6 +391,22 @@ struct Machine {
     /* CIO#1 Port A keyboard input */
     uint8_t  pa_data;
     bool     pa_irf;
+    bool     pa_up;        /* PC2: the delivered key is a release */
+    bool     pa_ip, pa_ie; /* Port A interrupt pending and enabled */
+    bool     pa_ius;       /* Port A interrupt under service: no new request */
+    bool     last_vi_pa;   /* the VI currently asserted came from Port A */
+
+    /* --key / --mouse: scripted keyboard and mouse events, timed in loop
+     * ticks from when --hw-mark is printed (from the start without one). */
+    struct hwev { unsigned long long at; int key; int dx, dy, btn; } *hwev;
+    int      nhwev, hwev_next;
+    const char *hw_mark;
+    int      hw_mark_pos;
+    bool     hw_armed;
+    unsigned long long hw_t0;
+    bool     mouse_on;     /* the mouse counters answer at 0x0400/0x0402 */
+    uint16_t mouse_x, mouse_y;
+    uint8_t  mouse_btn;
 
     RTC      rtc;          /* OKI MSM58321 on CIO #1 Port B + PC1 */
 
@@ -400,6 +416,8 @@ struct Machine {
 
     /* CIO #1 Counter/Timer 3 — the 100 Hz Coherent system tick */
     bool     ct3_running;
+    bool     ct12_running[2];  /* CIO #1 CT1, CT2: polled only, no interrupts */
+    uint32_t ct12_accum[2];
     uint32_t ct3_accum;    /* instruction accumulator toward terminal count */
 
     /* HDC command block base (physical); relocatable via WDCCBA */

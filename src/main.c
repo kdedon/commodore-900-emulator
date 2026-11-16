@@ -489,6 +489,97 @@ static int lc_selftest(void){
     return ok;
 }
 
+/* Run guest code at 08:0000 (and a Port A handler at 08:0100) against the
+ * scripted keys, which must each land once in the buffer at 08:9000. */
+static int kbd_run(const char *name, const uint16_t *prog, int nprog,
+                   const uint16_t *isr, int nisr){
+    static const uint8_t keys[] = { 0x14, 0x12, 0x1F, 0x14, 0x12, 0x13, 0x1C };   /* tester\r */
+    static const uint16_t rom[] = {
+        0x0000, 0xC000, 0x0800, 0x0000,                 /* reset: FCW, PC 08:0000 */
+    };
+    int n = (int)sizeof keys, ok = 1;
+    Machine *m = machine_new();
+    #define PUTW(b, a, v) do { (b)[(a)] = (uint8_t)((v) >> 8); (b)[(a) + 1] = (uint8_t)(v); } while (0)
+    for (int i = 0; i < 4; i++) PUTW(m->rom, 2 * i, rom[i]);
+    PUTW(m->rom, 0x3A, 0xC000);                         /* VI: FCW, interrupts off */
+    PUTW(m->rom, 0x4C, 0x0800); PUTW(m->rom, 0x4E, 0x0100);   /* vector 8: 08:0100 */
+    for (int i = 0; i < nprog; i++) PUTW(m->ram, 0x080000 + 2 * i, prog[i]);
+    for (int i = 0; i < nisr; i++) PUTW(m->ram, 0x080100 + 2 * i, isr[i]);
+    #undef PUTW
+    m->hwev = calloc((size_t)n, sizeof *m->hwev);
+    for (int i = 0; i < n; i++) m->hwev[i] = (struct hwev){ 2000ull * (i + 1), keys[i], 0, 0, 0 };
+    m->nhwev = n; m->hw_armed = true;
+    m->insn_limit = 2000ull * (n + 2);
+    machine_run(m);
+    int got = (m->ram[0x088F00] << 8) | m->ram[0x088F01];
+    if (got != n) { printf("%s FAIL: %d keys delivered, %d typed\n", name, got, n); ok = 0; }
+    for (int i = 0; i < n && i < got && ok; i++)
+        if ((m->ram[0x089000 + i] & 0x7F) != keys[i]) {
+            printf("%s FAIL: key %d read %02X, typed %02X\n", name, i, m->ram[0x089000 + i], keys[i]);
+            ok = 0;
+        }
+    if (ok) printf("%s PASSED (%d scripted keys, each read once)\n", name, n);
+    free(m->hwev); free(m->ram); free(m);
+    return ok;
+}
+
+/* The handler, like Coherent's, takes the key and echoes it with interrupts
+ * on before it clears IP and strobes PC3. */
+static int kbd_selftest(void){
+    static const uint16_t prog[] = {
+        0x140E, 0x0800, 0x8000,     /* LDL RR14,#08:8000 */
+        0xC880, 0x3A86, 0x0001,     /* MICR: MIE */
+        0xC804, 0x3A86, 0x0003,     /* MCC: Port A enable */
+        0xC808, 0x3A86, 0x0005,     /* Port A vector 8 */
+        0xC8C0, 0x3A86, 0x0011,     /* Port A: set IE */
+        0x7C05,                     /* EI VI */
+        0xE8FF,                     /* JR $ */
+    };
+    static const uint16_t isr[] = {
+        0x3A84, 0x001B,             /* INB RL0,PADATA */
+        0x1402, 0x0800, 0x8F00,     /* LDL RR2,#count */
+        0x2124,                     /* LD R4,@RR2 */
+        0x2920,                     /* INC @RR2 */
+        0x1406, 0x0800, 0x9000,     /* LDL RR6,#buffer */
+        0x8147,                     /* ADD R7,R4 */
+        0x2E68,                     /* LDB @RR6,RL0 */
+        0x1408, 0x0800, 0x8F02,     /* LDL RR8,#busy */
+        0x0D84,                     /* TEST @RR8 */
+        0xEE07,                     /* JR NZ,done */
+        0x2980,                     /* INC @RR8 */
+        0x7C05,                     /* EI VI: echo with interrupts on */
+        0x2105, 0x00C8,             /* LD R5,#200 */
+        0xF581,                     /* DJNZ R5,$ */
+        0x7C01,                     /* DI VI */
+        0x2B80,                     /* DEC @RR8 */
+        0xC820, 0x3A86, 0x0011,     /* done: Port A clear IP and IUS */
+        0xC870, 0x3A86, 0x001F,     /* PC3 Low: clear the key */
+        0xC878, 0x3A86, 0x001F,     /* PC3 High */
+        0x7B00,                     /* IRET */
+    };
+    return kbd_run("keyboard", prog, (int)(sizeof prog / 2), isr, (int)(sizeof isr / 2));
+}
+
+/* A driver that polls DAV with interrupts off and never touches IP. */
+static int kbd_poll_selftest(void){
+    static const uint16_t prog[] = {
+        0xC800, 0x3A86, 0x0001,     /* MICR: out of reset */
+        0x3A84, 0x001B,             /* wait: INB RL0,PADATA */
+        0x8C84,                     /* TESTB RL0 */
+        0xEDFC,                     /* JR PL,wait: no DAV */
+        0x1402, 0x0800, 0x8F00,     /* LDL RR2,#count */
+        0x2124,                     /* LD R4,@RR2 */
+        0x2920,                     /* INC @RR2 */
+        0x1406, 0x0800, 0x9000,     /* LDL RR6,#buffer */
+        0x8147,                     /* ADD R7,R4 */
+        0x2E68,                     /* LDB @RR6,RL0 */
+        0xC870, 0x3A86, 0x001F,     /* PC3 Low: clear the key */
+        0xC878, 0x3A86, 0x001F,     /* PC3 High */
+        0xE8EB,                     /* JR wait */
+    };
+    return kbd_run("polled keyboard", prog, (int)(sizeof prog / 2), NULL, 0);
+}
+
 static int selftest(void){
     Machine *m = machine_new();
     CPU *c = &m->cpu;
@@ -576,6 +667,9 @@ static int selftest(void){
     if (!shift_selftest()) ok = 0;
 
     if (!lc_selftest()) ok = 0;
+
+    if (!kbd_selftest()) ok = 0;
+    if (!kbd_poll_selftest()) ok = 0;
 
     free(m->ram); free(m);
     return ok ? 0 : 1;
@@ -713,6 +807,12 @@ static void usage(FILE *out, const char *prog){
         "                   VDC at 0x0181/0x0183 with 64 KB of RAM, no picture\n"
         "  --lc-screen=FILE fit the LC card and write its 80x25 text screen to\n"
         "                   FILE when the run ends (- for stdout)\n"
+        "  --key=T:HH       press keyboard scancode HH (hex; bit 7 = release) T loop\n"
+        "                   ticks after --hw-mark is printed (after the start\n"
+        "                   without one), once the last key has been taken\n"
+        "  --mouse=T:DX:DY[:B]  move the mouse counters by DX,DY and set buttons\n"
+        "                   B at tick T; the counters then answer at 0x0400/0x0402\n"
+        "  --hw-mark=TEXT   console text that starts the --key/--mouse clock\n"
         "  --lr-scc         fit the LR board's two SCCs (ports 2-5) with no wire\n"
         "                   attached.  Without this, and without a --wireN for one\n"
         "                   of its ports, 0x0300-0x03FF is not decoded at all\n"
@@ -821,6 +921,10 @@ int main(int argc, char **argv){
     const char *g_stopmark = NULL;   /* --stop-mark: guest-announced end of run */
     bool idle_asked = false;             /* --idle=N given: tuning it asks for it */
     bool require_stop = false;
+    const char *g_hwmark = NULL;
+    struct hwev *hwev = NULL;
+    int nhwev = 0;
+    bool mouse_on = false;
     for (int i=1;i<argc;i++){
         const char *v;
         if      ((v = opt_value(argv,argc,&i,"--rtc-ips"))) rtc_ips = strtoull(v,0,0);
@@ -855,6 +959,17 @@ int main(int argc, char **argv){
                 return 2;
             }
             ram_lo = (uint8_t)lo; ram_hi = (uint8_t)hi;
+        }
+        else if ((v = opt_value(argv,argc,&i,"--hw-mark"))) g_hwmark = v;
+        else if ((v = opt_value(argv,argc,&i,"--key")) || (v = opt_value(argv,argc,&i,"--mouse"))) {
+            struct hwev e = { 0, -1, 0, 0, 0 };
+            bool bad = strchr(v, ':') == strrchr(v, ':')
+                ? sscanf(v, "%llu:%x", &e.at, &e.key) != 2
+                : sscanf(v, "%llu:%d:%d:%d", &e.at, &e.dx, &e.dy, &e.btn) < 3;
+            if (bad) { fprintf(stderr,"--key=TICKS:HEXCODE or --mouse=TICKS:DX:DY[:BUTTONS]\n"); return 2; }
+            if (e.key < 0) mouse_on = true;
+            hwev = realloc(hwev, (size_t)(nhwev + 1) * sizeof *hwev);
+            hwev[nhwev++] = e;
         }
         else if (!strcmp(argv[i],"--hr")) hr_board = true;
         else if ((v = opt_value(argv,argc,&i,"--lc-screen"))) { lc_screen = v; lc_card = true; }
@@ -953,6 +1068,9 @@ int main(int argc, char **argv){
     m->stop_port  = on_port ? (uint16_t)g_stopport : 0;
     m->stop_mark  = (on_mark && mark_asked) ? g_stopmark : NULL;
     m->park_watch = on_park;
+    m->hwev = hwev; m->nhwev = nhwev; m->mouse_on = mouse_on;
+    m->hw_mark = (g_hwmark && *g_hwmark) ? g_hwmark : NULL;
+    m->hw_armed = m->hw_mark == NULL;
     m->key_quiet    = g_keypace;
     m->key_react    = g_keyreact ? (uint32_t)g_keyreact : 1;
     m->key_deadline = g_keydead;
