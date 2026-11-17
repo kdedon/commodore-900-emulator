@@ -29,6 +29,13 @@
  * cannot use the check-free fast path (see mmu_refresh_fast). */
 #define A_RESTRICT (A_CPU|A_RD|A_SYS|A_EXC|A_DIRW)
 
+/* The board feeds the CPU's A8/A9 straight to the bus and takes only PA10 up
+ * from the MMU, so a base's low two bits never reach memory: segments are
+ * placed on 1 KB boundaries (C900 System Hardware Specification 2.1.1). */
+static inline uint32_t board_pa(uint32_t base8, uint16_t off){
+    return ((base8 + off) & 0x00FFFC00) | (off & 0x3FF);
+}
+
 /* Recompute the fast-path cache for one descriptor. A descriptor is "simple"
  * (translatable without any protection/limit checks) when it has the full
  * 0xFF page limit and none of the restrictive attribute bits set. In that
@@ -150,7 +157,7 @@ uint32_t mmu_translate(MMU *u, uint8_t sn, uint16_t off,
         MmuDesc *d = &u->desc[seg];
         d->attr |= A_REF;
         if (is_write) d->attr |= A_CHG;
-        return (u->fast_base[seg] + off) & 0x00FFFFFF;
+        return board_pa(u->fast_base[seg], off);
     }
 
     /* Slow path: descriptor has a real limit and/or protection bits. */
@@ -186,7 +193,7 @@ uint32_t mmu_translate(MMU *u, uint8_t sn, uint16_t off,
      * deep-stacked process runs into the hard SLV above and is killed. */
     if ((d->attr & A_DIRW) && is_write && page == d->limit)
         latch_viol(u,VT_PWW,sn,off,is_write,is_normal,st,false);
-    return (((uint32_t)d->base << 8) + off) & 0x00FFFFFF;
+    return board_pa((uint32_t)d->base << 8, off);
 }
 
 /* ── command interface ── */
